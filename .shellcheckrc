@@ -1,0 +1,2 @@
+# "a= b=" empty assignments are intentional
+disable=SC1007

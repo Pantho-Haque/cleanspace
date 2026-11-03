@@ -1,127 +1,158 @@
 #!/usr/bin/env bash
-# Clear dev caches + unused Docker data. Never touches personal files. macOS + Linux.
-# Usage: cleanspace [--deep [dir]] [--dry-run] | --review | --update | --remove | --help
-#   --deep     also: build folders (node_modules, .next, target, ...) under dir (default ~/Desktop),
-#              browser caches (skipped while the browser runs), browser AI models, Trash
-#   --dry-run  show what would be freed, delete nothing
-#   --review   go through personal space hogs one by one (Downloads, old Node versions,
-#              Intel Homebrew, iOS backups, ...) and ask before removing each
-#   --update   fetch the latest version
-#   --remove   uninstall cleanspace and its shell-rc lines
+# cleanspace: free disk space on macOS and Linux without losing anything you care about.
+#
+# Usage: cleanspace [options]          (the installer also sets up the alias: clean)
+#   (no option)       scan, show what can go and how each item comes back, ask, then clean
+#   --deep [dir]      also browser caches, idle app caches, the Trash, and build folders
+#                     (node_modules, target, ...) of projects under dir or your code folders
+#   --older DAYS      with --deep, keep builds of projects edited in the last DAYS days (default 14)
+#   -n, --dry-run     show the plan only, delete nothing
+#   -y, --yes         clean without asking (needed when not run from a terminal)
+#   --review          go through personal space hogs one at a time, asking before each
+#   --stats           space freed so far, and which caches grow back fastest
+#   --schedule [daily|weekly|off]
+#                     clean automatically whenever free space drops below a limit (default 20G)
+#   --auto            what the schedule runs: clean only if free space is below the limit
+#   --config          show the config file (exclusions, code folders, limits), creating it if needed
+#   --update          update to the latest version
+#   --remove          uninstall cleanspace with its schedule, settings and history
+#   --version, -h, --help
+#
+# Exit codes: 0 done, 1 error, 2 confirmation needed (no terminal, use --yes), 130 interrupted.
 
+VERSION=2.1.0
+unset GUARD GUARDF BACK SIZE NEEDCMD   # item() reads these; never inherit them
 RAW=https://raw.githubusercontent.com/Pantho-Haque/cleanspace/main
-G=$'\e[32m' Y=$'\e[33m' D=$'\e[2m' B=$'\e[1m' R=$'\e[0m'
+JOB=io.github.pantho-haque.cleanspace
 OS=$(uname -s)
-SELF=$(command -v "$0")
-DEEP= DRY= ACTION= DIR=~/Desktop
+SELF=$(command -v -- "$0" 2>/dev/null) || SELF=$0
+case $SELF in /*) ;; *) SELF=$PWD/$SELF ;; esac
+STATE=${XDG_STATE_HOME:-$HOME/.local/state}/cleanspace
+CONF=${XDG_CONFIG_HOME:-$HOME/.config}/cleanspace/config
+HIST=$STATE/history.tsv
+T='~'
 
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then
+  G=$'\e[32m' Y=$'\e[33m' RED=$'\e[31m' D=$'\e[2m' B=$'\e[1m' R=$'\e[0m' EL=$'\r\e[K'
+else
+  G= Y= RED= D= B= R= EL=
+fi
+VIS=; [ -t 1 ] && VIS=1                     # animate (spinner, scan progress)
+IN=${CLEANSPACE_INPUT:-/dev/tty}            # where answers come from (tests point this at a file)
+ASK=; { [ -t 1 ] || [ -n "${CLEANSPACE_INPUT:-}" ]; } && { : <"$IN"; } 2>/dev/null && ASK=1
+
+die()  { echo "${RED}cleanspace:${R} $*" >&2; exit 1; }
+warn() { echo "${Y}!${R} $*" >&2; }
+ok()   { echo "${G}✓${R} $*"; }
+trim() { local s=$1; s=${s#"${s%%[![:space:]]*}"}; printf %s "${s%"${s##*[![:space:]]}"}"; }
+
+# ---------------------------------------------------------------- arguments
+DEEP= DRY= YES= AUTO= ACTION= SCHED= OLDER= DIRS=()
 while [ $# -gt 0 ]; do
   case $1 in
-    --deep) DEEP=1; [ -d "$2" ] && { DIR=${2%/}; shift; } ;;
+    --deep) DEEP=1
+            if [ -n "${2:-}" ] && [ "${2#-}" = "$2" ]; then
+              [ -d "$2" ] || die "no such folder: $2"; DIRS+=("${2%/}"); shift
+            fi ;;
+    --older) [[ ${2:-} =~ ^[0-9]+$ ]] || die "--older needs a number of days"; OLDER=$2; shift ;;
     -n|--dry-run) DRY=1 ;;
-    --review|--update|--remove|-h|--help) ACTION=$1 ;;
-    *) echo "unknown option: $1 (see cleanspace --help)"; exit 1 ;;
+    -y|--yes) YES=1 ;;
+    --auto) AUTO=1 YES=1 ;;
+    --schedule) ACTION=$1
+                case ${2:-} in daily|weekly|off) SCHED=$2; shift ;; *) SCHED=daily ;; esac ;;
+    --review|--stats|--config|--update|--remove|--version|-h|--help) ACTION=$1 ;;
+    *) die "unknown option: $1 (see cleanspace --help)" ;;
   esac
   shift
 done
 
-case $ACTION in
-  -h|--help) sed -n '2,11s/^# \{0,1\}//p' "$SELF"; exit ;;
-  --update)
-    if [ -L "$SELF" ]; then   # dev install: symlink into a git checkout
-      git -C "$(dirname "$(readlink "$SELF")")" pull --ff-only
-    else
-      curl -fsSL "$RAW/cleanspace" -o "$SELF.tmp" && chmod +x "$SELF.tmp" && mv -f "$SELF.tmp" "$SELF" ||
-        { rm -f "$SELF.tmp"; echo "update failed"; exit 1; }
-    fi
-    echo "${G}✓${R} cleanspace updated"; exit ;;
-  --remove)
-    rm -f "$SELF"
-    for rc in ~/.zshrc ~/.bashrc ~/.bash_profile; do
-      [ -f "$rc" ] && grep -q '# cleanspace$' "$rc" || continue
-      grep -v '# cleanspace$' "$rc" > "$rc.tmp"; cat "$rc.tmp" > "$rc"; rm -f "$rc.tmp"
-    done
-    echo "${G}✓${R} cleanspace removed (open a new shell to drop the 'clean' alias)"; exit ;;
-esac
+# ---------------------------------------------------------------- config
+EXCL=() CDIRS=() AUTO_GB=20 OLDER_CONF=14
+if [ -f "$CONF" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in \#*|"") continue ;; *=*) ;; *) warn "config: ignoring '$line'"; continue ;; esac
+    k=$(trim "${line%%=*}") v=$(trim "${line#*=}")
+    # shellcheck disable=SC2088  # a literal ~ from the file, expanded by hand
+    case $v in "~"|"~/"*) v=$HOME${v#"~"} ;; esac
+    case $k in
+      exclude)       EXCL+=("${v%/}") ;;
+      deep_dir)      CDIRS+=("${v%/}") ;;
+      older_days)    [[ $v =~ ^[0-9]+$ ]] && OLDER_CONF=$v || warn "config: older_days must be a number" ;;
+      auto_below_gb) [[ $v =~ ^[0-9]+$ ]] && AUTO_GB=$v || warn "config: auto_below_gb must be a number" ;;
+      *) warn "config: unknown setting '$k'" ;;
+    esac
+  done < "$CONF"
+fi
+OLDER=${OLDER:-$OLDER_CONF}
 
 if [ "$OS" = Darwin ]; then
-  C=~/Library/Caches S=~/Library/Application\ Support PNPM=~/Library/pnpm/store YARN=Yarn
+  C=$HOME/Library/Caches S=$HOME/Library/Application\ Support PNPM=$HOME/Library/pnpm/store YARN=Yarn
 else
-  C=${XDG_CACHE_HOME:-~/.cache} S=${XDG_CONFIG_HOME:-~/.config} PNPM=~/.local/share/pnpm/store YARN=yarn
+  C=${XDG_CACHE_HOME:-$HOME/.cache} S=${XDG_CONFIG_HOME:-$HOME/.config} PNPM=$HOME/.local/share/pnpm/store YARN=yarn
 fi
-total=0 T='~'
+# Everything under C and S counts as deletable, so a cache or config dir set to /, home, or a parent of home is ignored.
+for v in C S; do
+  case "$HOME/" in "${!v%/}"/*)
+    if [ $v = C ]; then warn "ignoring XDG_CACHE_HOME=$C: it must be its own folder"; C=$HOME/.cache
+    else warn "ignoring XDG_CONFIG_HOME=$S: it must be its own folder"; S=$HOME/.config; fi ;;
+  esac
+done
 
+# ---------------------------------------------------------------- helpers
+kb()       { [ $# -gt 0 ] || { echo 0; return; }; du -sk "$@" 2>/dev/null | awk '{s+=$1} END {print s+0}'; }
+human()    { awk -v k="$1" 'BEGIN { if (k>=1073741824) printf "%.1fT", k/1073741824; else if (k>=1048576) printf "%.1fG", k/1048576;
+                                    else if (k>=1024) printf "%.0fM", k/1024; else printf "%dK", k }'; }
+freekb()   { df -Pk "$HOME" | awk 'NR==2 {print $4}'; }
 diskfree() { df -Ph "$HOME" | awk 'NR==2 {print $4 " free (" $5 " used)"}'; }
-kb()       { du -sk "$@" 2>/dev/null | awk '{s+=$1} END {print s+0}'; }
-human()    { awk -v k=$1 'BEGIN { if (k>=1048576) printf "%.1fG", k/1048576; else if (k>=1024) printf "%.0fM", k/1024; else printf "%dK", k }'; }
+tilde()    { printf %s "${1/#$HOME/$T}"; }
+recent()   { [ -n "$(find "$1" -maxdepth 3 -mtime -"$2" -print -quit 2>/dev/null)" ]; }   # anything in $1 changed in $2 days?
 
-# Run a command in the background with a spinner. Usage: spin "label" cmd...
-spin() {
-  local label=$1; shift
-  local frames=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏) i=0
-  "$@" >/dev/null 2>&1 &
-  local pid=$!
-  while kill -0 $pid 2>/dev/null; do
-    printf "\r  ${Y}%s${R} %s" "${frames[i++ % 10]}" "$label"
-    sleep 0.1
-  done
-  wait $pid
+SPID= LOCKED= RUNNING= total=0
+spin() {   # spin "message" cmd...: run cmd quietly, with a spinner on a terminal. Returns cmd's status.
+  local msg=$1; shift
+  if [ -z "$VIS" ]; then "$@" >/dev/null 2>&1; return; fi
+  local f=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏) i=0
+  "$@" >/dev/null 2>&1 & SPID=$!
+  while kill -0 "$SPID" 2>/dev/null; do printf "\r  ${Y}%s${R} %s" "${f[i++ % 10]}" "$msg"; sleep 0.1; done
+  wait "$SPID"; local rc=$?; SPID=; return $rc
+}
+progress() { [ -n "$VIS" ] && printf "%s  ${D}scanning %s…${R}" "$EL" "$1"; }
+
+lock() {
+  mkdir -p "$STATE" || die "cannot create $STATE"
+  if ! mkdir "$STATE/lock" 2>/dev/null; then
+    local pid; pid=$(cat "$STATE/lock/pid" 2>/dev/null)
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && die "another cleanspace is already running (pid $pid)"
+    rm -rf "$STATE/lock"; mkdir "$STATE/lock" || die "cannot lock $STATE"
+  fi
+  echo $$ > "$STATE/lock/pid"; LOCKED=1
+}
+cleanup() { [ -n "$SPID" ] && kill "$SPID" 2>/dev/null; [ -n "$LOCKED" ] && rm -rf "$STATE/lock"; }
+interrupted() {
+  [ -n "$SPID" ] && kill "$SPID" 2>/dev/null; SPID=
+  printf "%s\n${Y}Interrupted.${R}" "$EL"
+  if [ -n "$RUNNING" ]; then
+    printf " Freed so far: ${B}%s${R}" "$(human $total)"
+    [ -n "$HROWS" ] && printf %s "$HROWS" >> "$HIST"
+  fi
+  echo
+  exit 130
+}
+trap cleanup EXIT
+trap interrupted INT TERM
+
+notify() {
+  if [ "$OS" = Darwin ]; then
+    osascript -e 'on run a' -e 'display notification (item 1 of a) with title "cleanspace"' -e 'end run' "$1" >/dev/null 2>&1
+  else command -v notify-send >/dev/null && notify-send cleanspace "$1" 2>/dev/null; fi
 }
 
-# Usage: [GUARD=procname] item "label" path... [-- cleanup-cmd...]   (no cmd = rm -rf the paths)
-# GUARD skips the item while that process runs.
-item() {
-  local label=$1; shift
-  local paths=() cmd=() p
-  while [ $# -gt 0 ] && [ "$1" != -- ]; do
-    case ${1%/} in ""|/|"$HOME") ;; *) paths+=("$1") ;; esac   # never the home dir or /
-    shift
-  done
-  [ "$1" = -- ] && { shift; cmd=("$@"); }
-
-  local before=0
-  [ ${#paths[@]} -gt 0 ] && before=$(kb "${paths[@]}")
-  if [ "$before" -eq 0 ]; then
-    printf "  ${D}·  %-28s already clean${R}\n" "$label"; return
-  fi
-  if [ -n "$GUARD" ] && pgrep -x "$GUARD" >/dev/null; then
-    printf "  ${Y}·${R}  %-28s %7s  ${D}skipped, $GUARD is running${R}\n" "$label" "$(human $before)"; return
-  fi
-  if [ -n "$DRY" ]; then
-    total=$(( total + before ))
-    printf "  ${Y}○${R}  %-28s ${B}%7s${R} would be freed\n" "$label" "$(human $before)"; return
-  fi
-
-  local msg=$(printf "%-28s %7s  removing..." "$label" "$(human $before)")
-  if [ ${#cmd[@]} -gt 0 ] && command -v "${cmd[0]}" >/dev/null; then
-    spin "$msg" "${cmd[@]}"
-  else
-    chmod -R u+w "${paths[@]}" 2>/dev/null   # Go module cache is read-only
-    spin "$msg" rm -rf "${paths[@]}"
-  fi
-
-  local freed=$(( before - $(kb "${paths[@]}") ))
-  total=$(( total + freed ))
-  printf "\r\033[K  ${G}✓${R}  %-28s ${B}%7s${R} freed\n" "$label" "$(human $freed)"
+# Answer y/N. Always "no" in a dry run.
+ask() {
+  [ -z "$DRY" ] || { echo "$1 [dry run: no]"; return 1; }
+  local a; printf "%s [y/N] " "$1"; read -r a <"$IN" || return 1
+  [ "$a" = y ] || [ "$a" = Y ] || [ "$a" = yes ]
 }
-
-# item, with paths read from stdin, one per line.  Usage: collect "label" < <(cmd)
-collect() { local label=$1 p a=(); while read -r p; do a+=("$p"); done; item "$label" "${a[@]}"; }
-
-# Print entries of dir $1 except the newest $2 and except path $3.
-older() {
-  [ -d "$1" ] || return
-  ls -t "$1" | tail -n +$(( $2 + 1 )) | while read -r v; do [ "$1/$v" != "$3" ] && echo "$1/$v"; done
-}
-
-# Report a path without deleting it, if it's over 100M.
-note() {
-  local k=$(kb "${@:2}")
-  [ "$k" -gt 102400 ] && printf "  ${D}·${R}  %-28s %7s  ${D}%s${R}\n" "$1" "$(human $k)" "${2/#$HOME/$T}"
-}
-
-# Ask y/N on the terminal. Always "no" in a dry run.
-ask() { [ -z "$DRY" ] || { echo "$1 [dry run: no]"; return 1; }; local a; read -r -p "$1 [y/N] " a </dev/tty; [ "$a" = y ] || [ "$a" = Y ]; }
 
 totrash() {
   if [ -x /usr/bin/trash ]; then /usr/bin/trash "$1"                     # macOS 15+
@@ -131,21 +162,578 @@ totrash() {
   else mkdir -p ~/.local/share/Trash/files && mv "$1" ~/.local/share/Trash/files/; fi
 }
 
-# Ask about each entry of dir $1 over 100M, biggest first.  $2 = trash | delete
-pick() {
+# ---------------------------------------------------------------- simple actions
+schedule() {
+  local when=$1 cron
+  if [ "$OS" = Darwin ]; then
+    local plist=$HOME/Library/LaunchAgents/$JOB.plist wd=
+    launchctl bootout "gui/$(id -u)/$JOB" 2>/dev/null; rm -f "$plist"
+    [ "$when" = off ] && return
+    [ "$when" = weekly ] && wd='<key>Weekday</key><integer>1</integer>'
+    mkdir -p "$HOME/Library/LaunchAgents" "$STATE"
+    cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$JOB</string>
+  <key>ProgramArguments</key><array><string>$SELF</string><string>--auto</string></array>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>$PATH</string></dict>
+  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>0</integer>$wd</dict>
+  <key>StandardOutPath</key><string>$STATE/auto.log</string>
+  <key>StandardErrorPath</key><string>$STATE/auto.log</string>
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>10</integer>
+</dict></plist>
+EOF
+    launchctl bootstrap "gui/$(id -u)" "$plist" || die "launchctl could not load $plist"
+    return
+  fi
+  local units=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
+  if [ -f "$units/cleanspace.timer" ]; then
+    systemctl --user disable --now cleanspace.timer >/dev/null 2>&1; rm -f "$units"/cleanspace.service "$units"/cleanspace.timer
+    systemctl --user daemon-reload 2>/dev/null
+  fi
+  if command -v crontab >/dev/null && crontab -l 2>/dev/null | grep -q '# cleanspace$'; then
+    crontab -l 2>/dev/null | grep -v '# cleanspace$' | crontab -
+  fi
+  [ "$when" = off ] && return
+  if command -v systemctl >/dev/null && systemctl --user show-environment >/dev/null 2>&1; then
+    mkdir -p "$units" "$STATE"
+    printf '[Unit]\nDescription=cleanspace: clean caches when disk space is low\n\n[Service]\nType=oneshot\nEnvironment="PATH=%s"\nExecStart="%s" --auto\nNice=10\nIOSchedulingClass=idle\nStandardOutput=append:%s\nStandardError=append:%s\n' \
+      "$PATH" "$SELF" "$STATE/auto.log" "$STATE/auto.log" > "$units/cleanspace.service"
+    printf '[Unit]\nDescription=cleanspace %s check\n\n[Timer]\nOnCalendar=%s\nPersistent=true\nRandomizedDelaySec=1h\n\n[Install]\nWantedBy=timers.target\n' \
+      "$when" "$when" > "$units/cleanspace.timer"
+    systemctl --user daemon-reload && systemctl --user enable --now cleanspace.timer >/dev/null 2>&1 ||
+      die "systemctl could not enable the timer"
+  elif command -v crontab >/dev/null; then
+    mkdir -p "$STATE"
+    [ "$when" = weekly ] && cron='0 11 * * 1' || cron='0 11 * * *'
+    { crontab -l 2>/dev/null; echo "$cron PATH='$PATH' '$SELF' --auto >> '$STATE/auto.log' 2>&1 # cleanspace"; } | crontab - ||
+      die "crontab could not be updated"
+  else
+    die "no systemd user session or cron found to schedule with"
+  fi
+}
+
+schedule_status() {
+  local f
+  if [ "$OS" = Darwin ]; then f=$HOME/Library/LaunchAgents/$JOB.plist
+    [ -f "$f" ] || { echo off; return; }
+    grep -q Weekday "$f" && echo weekly || echo daily
+  elif [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/cleanspace.timer" ]; then
+    sed -n 's/^OnCalendar=//p' "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/cleanspace.timer"
+  elif crontab -l 2>/dev/null | grep -q '# cleanspace$'; then
+    crontab -l | grep -q '^0 11 \* \* 1 ' && echo weekly || echo daily
+  else echo off; fi
+}
+
+stats() {
+  echo "${B}cleanspace stats${R}"
+  local s; s=$(schedule_status)
+  if [ "$s" = off ]; then echo "  Schedule: off  ${D}(turn on with: cleanspace --schedule)${R}"
+  else echo "  Schedule: $s, cleans when free space is below ${AUTO_GB}G  ${D}(log: $(tilde "$STATE/auto.log"))${R}"; fi
+  [ -s "$HIST" ] || { echo "  No cleans recorded yet. Run clean to start."; return; }
+  local summary first runs freed
+  summary=$(awk -F'\t' '{ runs[$1]=1; tot+=$4; if (!first || $1<first) first=$1 } END { n=0; for (r in runs) n++; print n, tot, first }' "$HIST")
+  read -r runs freed first <<< "$summary"
+  first=$(date -r "$first" +%F 2>/dev/null || date -d "@$first" +%F)
+  echo "  Freed ${G}${B}$(human "$freed")${R} over $runs cleans since $first"
+  echo; echo "${B}Biggest wins${R}"
+  awk -F'\t' '{ f[$2]+=$4 } END { for (l in f) if (f[l] > 0) printf "%d\t%s\n", f[l], l }' "$HIST" | sort -rn | head -5 |
+    while IFS=$'\t' read -r k l; do printf "  %-30s %7s\n" "$l" "$(human "$k")"; done
+  # Regrowth: what an item had grown back to at each clean, divided by the time since the clean before.
+  local grow
+  grow=$(awk -F'\t' '{ if ($2 in last && $1 > last[$2]) { g[$2]+=$3; dt[$2]+=$1-last[$2] } last[$2]=$1 }
+    END { for (l in g) if (dt[l] >= 86400 && g[l] > 0) printf "%d\t%s\n", g[l]/dt[l]*604800, l }' "$HIST" | sort -rn | head -5)
+  echo; echo "${B}Fastest to grow back${R}  ${D}(per week, measured between cleans)${R}"
+  if [ -z "$grow" ]; then echo "  ${D}needs two cleans at least a day apart${R}"
+  else while IFS=$'\t' read -r k l; do printf "  %-30s %7s/week\n" "$l" "$(human "$k")"; done <<< "$grow"; fi
+}
+
+case $ACTION in
+  -h|--help) awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "$SELF"; exit ;;
+  --version) echo "cleanspace $VERSION"; exit ;;
+  --stats) stats; exit ;;
+  --config)
+    if [ ! -f "$CONF" ]; then
+      mkdir -p "$(dirname "$CONF")" && cat > "$CONF" <<'EOF'
+# cleanspace settings. One "key = value" per line; lines starting with # are ignored.
+
+# Never touch something. Matches an item's name (as shown in the plan) or a path, and
+# accepts * wildcards. Repeat the line for more.
+# exclude = Docker images & build cache
+# exclude = ~/Library/Caches/com.spotify.client
+# exclude = ~/code/keep-this-project/*
+
+# Folders --deep searches for project build folders. Repeat for more.
+# Default: whichever of ~/Desktop ~/Documents ~/Developer ~/code ~/dev ~/projects ~/src ~/repos ~/work exist.
+# deep_dir = ~/code
+
+# With --deep, keep builds of projects edited in the last N days (0 = clean all).
+# older_days = 14
+
+# The schedule (cleanspace --schedule) only cleans when free space is below this many GB.
+# auto_below_gb = 20
+EOF
+      ok "created $(tilde "$CONF")"
+    fi
+    echo "Config file: $(tilde "$CONF")  ${D}(edit it with: \${EDITOR:-nano} $(tilde "$CONF"))${R}"; echo
+    grep -v '^#' "$CONF" | grep . || echo "${D}(everything is commented out, so the defaults apply)${R}"
+    exit ;;
+  --schedule)
+    if [ "$SCHED" = off ]; then schedule off; ok "schedule removed"; exit; fi
+    schedule "$SCHED"
+    ok "cleanspace will check $SCHED and clean caches when free space is below ${AUTO_GB}G"
+    echo "  ${D}It never touches --deep or --review items. Change the limit with cleanspace --config; stop with --schedule off.${R}"
+    exit ;;
+  --update)
+    if [ -L "$SELF" ]; then   # dev install: symlink into a git checkout
+      git -C "$(dirname "$(readlink "$SELF")")" pull --ff-only || die "git pull failed"
+      ok "updated checkout"; exit
+    fi
+    tmp=$SELF.tmp.$$
+    curl -fsSL "$RAW/cleanspace" -o "$tmp" || { rm -f "$tmp"; die "download failed"; }
+    new=$(sed -n 's/^VERSION=//p' "$tmp" | head -1)
+    if [ -z "$new" ] || ! bash -n "$tmp" 2>/dev/null; then rm -f "$tmp"; die "downloaded file looks broken, kept $VERSION"; fi
+    [ "$new" = "$VERSION" ] && { rm -f "$tmp"; ok "already up to date ($VERSION)"; exit; }
+    chmod +x "$tmp" && mv -f "$tmp" "$SELF" || { rm -f "$tmp"; die "could not replace $SELF"; }
+    ok "updated cleanspace $VERSION → $new"; exit ;;
+  --remove)
+    [ "$(schedule_status)" = off ] || schedule off
+    rm -rf "$STATE" "$(dirname "$CONF")"
+    for rc in ~/.zshrc ~/.bashrc ~/.bash_profile; do
+      [ -f "$rc" ] && grep -q '# cleanspace$' "$rc" || continue
+      grep -v '# cleanspace$' "$rc" > "$rc.tmp"; cat "$rc.tmp" > "$rc"; rm -f "$rc.tmp"
+    done
+    rm -f "$SELF"
+    ok "cleanspace removed with its schedule, settings and history (open a new shell to drop the 'clean' alias)"; exit ;;
+esac
+
+# ---------------------------------------------------------------- scanning
+# Every item is measured first; nothing is deleted until the plan is confirmed.
+# Arrays per item: L label, SEC section, K size in KB, ST status, WHY reason, BK how it comes back,
+# P paths (newline-separated), CMD the tool's own clean command (\x1f-separated).
+N=0 SECT= SBACK= COV=() ROOTS=()
+
+section() { SECT=$1 SBACK=$2; }
+
+excluded() {   # is this label or path excluded in the config?
+  local pat hit=1
+  [ ${#EXCL[@]} -gt 0 ] || return 1
+  shopt -s nocasematch
+  for pat in "${EXCL[@]}"; do
+    # shellcheck disable=SC2254
+    case $1 in $pat|$pat/*) hit=0; break ;; esac
+    case $pat in "$1"/*) hit=0; break ;; esac        # an excluded path inside this one: keep the whole thing
+  done
+  shopt -u nocasematch
+  return $hit
+}
+
+safe_path() {  # only ever delete inside home, the cache/config dirs, or folders given to --deep
+  local r
+  case $1 in ""|/|"$HOME"|*/../*|*/..|*/.) return 1 ;; "$HOME"/*|"$C"/*|"$S"/*) return 0 ;; esac
+  for r in "${ROOTS[@]}"; do case $1 in "$r"/*) return 0 ;; esac; done
+  return 1
+}
+
+# [GUARD=process] [GUARDF=pattern] [BACK=kind] [SIZE=kb] [NEEDCMD=1] item "label" path... [-- tool clean command...]
+#   GUARD    skip while that process runs     GUARDF  skip while any command line contains pattern
+#   BACK     how it comes back: auto | dl | build | gone | manual:<command to get it back>
+#   SIZE     size when there are no paths     NEEDCMD  skip unless the tool's own command is installed
+item() {
+  local label=$1 paths=() cmd=() p had=0 k st=todo why=
+  shift
+  while [ $# -gt 0 ] && [ "$1" != -- ]; do
+    p=${1%/}; had=1
+    case $'\n'"${paths[*]}"$'\n' in *$'\n'"$p"$'\n'*) shift; continue ;; esac     # listed twice
+    if safe_path "$p" && ! excluded "$p"; then paths+=("$p"); COV+=("$p"); fi
+    shift
+  done
+  [ "${1:-}" = -- ] && { shift; cmd=("$@"); }
+  progress "$label"
+  k=${SIZE:-$(kb "${paths[@]}")}
+  if excluded "$label" || { [ $had = 1 ] && [ ${#paths[@]} = 0 ]; }; then st=excluded
+  elif [ "${k:-0}" -eq 0 ]; then st=clean
+  elif [ -n "${GUARD:-}" ] && pgrep -x "$GUARD" >/dev/null 2>&1; then st=skip why="$GUARD is running"
+  elif [ -n "${GUARDF:-}" ] && pgrep -f -- "$GUARDF" >/dev/null 2>&1; then st=skip why="a running program uses it"
+  elif [ -n "${NEEDCMD:-}" ] && ! command -v "${cmd[0]}" >/dev/null; then st=skip why="${cmd[0]} is not on PATH"
+  elif [ -n "$AUTO" ]; then case ${BACK:-$SBACK} in manual:*) st=skip why="needs a manual reinstall, so the schedule leaves it" ;; esac
+  fi
+  L[N]=$label SEC[N]=$SECT K[N]=${k:-0} ST[N]=$st WHY[N]=$why BK[N]=${BACK:-$SBACK}
+  local IFS=$'\n'; P[N]="${paths[*]}"
+  IFS=$'\x1f'; CMD[N]="${cmd[*]}"
+  N=$((N + 1))
+}
+
+# item, with paths read from stdin, one per line.  Usage: collect "label" < <(cmd)
+collect() { local label=$1 p a=(); while IFS= read -r p; do a+=("$p"); done; item "$label" "${a[@]}"; }
+
+# Entries of dir $1 except the newest $2 and except path $3.
+older() {
   [ -d "$1" ] || return
-  local k p
-  while IFS=$'\t' read -r k p; do
-    [ "$k" -gt 102400 ] || break
-    ask "  $(printf '%7s' "$(human $k)")  ${p/#$HOME/$T}  → $2?" || continue
-    if [ "$2" = trash ]; then totrash "$p" && trashed=$(( trashed + k ))
-    else rm -rf "$p" && total=$(( total + k )); fi
-  done < <(du -sk "$1"/* 2>/dev/null | sort -rn)
+  ls -t "$1" | tail -n +$(( $2 + 1 )) | while IFS= read -r v; do [ "$1/$v" != "$3" ] && echo "$1/$v"; done
+}
+
+# JetBrains keeps a cache folder per IDE version (WebStorm2024.3, WebStorm2025.1, ...); keep the newest of each.
+old_jetbrains() {
+  [ -d "$1" ] || return
+  ls -t "$1" | while IFS= read -r v; do
+    p=$(printf %s "$v" | sed 's/[0-9.]*$//')
+    case " $seen " in *" $p "*) echo "$1/$v" ;; *) seen="$seen $p" ;; esac
+  done
+}
+
+# Chromium cache folders inside a browser's profile folder. Only these named leaves: never the profile itself.
+chromium_leaves() {
+  local ud=$1 d n
+  [ -d "$ud" ] || return
+  for n in ShaderCache GrShaderCache GraphiteDawnCache component_crx_cache; do echo "$ud/$n"; done
+  for d in "$ud"/Default "$ud"/Profile\ * "$ud"/Guest\ Profile; do
+    [ -d "$d" ] || continue
+    for n in Cache "Code Cache" GPUCache DawnCache GrShaderCache GraphiteDawnCache DawnGraphiteCache DawnWebGPUCache "Application Cache"; do
+      echo "$d/$n"; done
+  done
+}
+
+# Electron/Chromium app caches one level inside the app support folder (Slack, Discord, VS Code, Postman, ...).
+# A plain "Cache" or "CachedData" only counts when a Chromium marker folder sits next to it (as Mole does),
+# so a non-Electron app's own folder called Cache is left alone.
+electron_caches() {
+  local app n
+  for app in "$S"/*/; do
+    app=${app%/}
+    [ -d "$app/Code Cache" ] || [ -d "$app/GPUCache" ] || [ -d "$app/DawnCache" ] || [ -d "$app/DawnGraphiteCache" ] ||
+      [ -d "$app/GrShaderCache" ] || continue
+    for n in Cache "Code Cache" GPUCache CachedData CachedExtensionVSIXs DawnCache DawnGraphiteCache GraphiteDawnCache \
+             DawnWebGPUCache GrShaderCache ShaderCache Crashpad/completed; do
+      [ -d "$app/$n" ] && echo "$app/$n"
+    done
+  done
+}
+
+# Editor extensions VS Code / Cursor have marked obsolete (replaced by a newer version) in extensions/.obsolete.
+obsolete_extensions() {
+  local dir k
+  for dir in ~/.vscode/extensions ~/.vscode-insiders/extensions ~/.cursor/extensions ~/.windsurf/extensions; do
+    [ -f "$dir/.obsolete" ] || continue
+    grep -oE '"[^"/]+"[[:space:]]*:[[:space:]]*true' "$dir/.obsolete" | sed 's/^"//; s/".*//' |
+      while IFS= read -r k; do [ -n "$k" ] && [ -d "$dir/$k" ] && echo "$dir/$k"; done
+  done
+}
+
+# Cache folders no other item covers and that nothing has touched for a week (so the app is idle).
+idle_caches() {
+  local e r name
+  for e in "$C"/*; do
+    [ -d "$e" ] || continue
+    name=${e##*/}
+    case $name in   # Apple's own, AI models, and apps whose "cache" holds data or licences (Mole's protection list)
+      com.apple.*|CloudKit*|huggingface|torch|ollama|llama.cpp|JetBrains|com.jetbrains.*|pip|pypoetry|uv|go-build|pnpm|\
+      ms-playwright|kitty|tealdeer|org.R-project.R|com.nssurge.*|app.cotypist.*|com.displaylink.*|com.lasersoft-imaging.*|\
+      GIPPseudonymousID|CCTClearcutLogger|com.1password.*|com.agilebits.*|com.bitwarden.*|*keepassxc*) continue ;;
+    esac
+    if [ "$OS" = Darwin ]; then case $name in *.*) ;; *) continue ;; esac; fi   # bundle ids only, not system folders
+    for r in "${COV[@]}"; do case $r in "$e"|"$e"/*) continue 2 ;; esac; done
+    recent "$e" 7 && continue
+    echo "$e"
+  done
+}
+
+docker_kb() {  # reclaimable image + build cache size (docker reports SI units)
+  docker system df --format '{{.Type}}    {{.Reclaimable}}' 2>/dev/null | awk -F'\t' '$1 ~ /Images|Build/ {
+    v=$2; sub(/ .*/, "", v); n=v+0; u=v; gsub(/[0-9.]/, "", u)
+    m = u=="kB" || u=="KB" ? 1e3 : u=="MB" ? 1e6 : u=="GB" ? 1e9 : u=="TB" ? 1e12 : 1
+    s += n*m/1024 } END { printf "%d", s }'
+}
+
+# ponytail: a folder named like a build folder is never searched inside, so projects nested under e.g. a "bin" folder are missed.
+BUILD_NAMES="node_modules .next .nuxt .svelte-kit .angular .astro .expo .metro .turbo .parcel-cache target .xwin-cache .gradle build
+  cmake-build-debug cmake-build-release Pods vendor .dart_tool .build .zig-cache zig-cache zig-out _build .elixir_ls .elixir-tools
+  .lexical .stack-work dist-newstyle elm-stuff bin obj Library Temp Binaries Intermediate DerivedDataCache .godot .terraform .pixi
+  .terragrunt-cache .output coverage DerivedData .cxx __pycache__ .pytest_cache .mypy_cache .ruff_cache .tox .nox __pypackages__"
+PY_CACHES=" __pycache__ .pytest_cache .mypy_cache .ruff_cache .tox .nox __pypackages__ "
+any() { [ -e "$1" ]; }   # any "$dir"/*.csproj: does the glob match something?
+
+# Does a project file that owns this build folder sit next to it? (So a random "target" or "vendor" is never touched.)
+owned() {
+  local p=$2
+  case $1 in
+    node_modules|.next|.nuxt|.output|.svelte-kit|.angular|.astro|.expo|.metro|.turbo|.parcel-cache|coverage) [ -f "$p/package.json" ] ;;
+    DerivedData)          any "$p"/*.xcodeproj || any "$p"/*.xcworkspace ;;
+    .cxx)                 any "$p"/build.gradle* ;;                                  # React Native / Android NDK
+    .terragrunt-cache)    [ -f "$p/terragrunt.hcl" ] ;;
+    target)               [ -f "$p/Cargo.toml" ] || [ -f "$p/pom.xml" ] || [ -f "$p/build.sbt" ] ;;
+    .xwin-cache)          [ -f "$p/Cargo.toml" ] ;;
+    .gradle)              any "$p"/build.gradle* || any "$p"/settings.gradle* ;;
+    build)                any "$p"/build.gradle* || [ -f "$p/CMakeLists.txt" ] || [ -f "$p/pubspec.yaml" ] ;;
+    cmake-build-*)        [ -f "$p/CMakeLists.txt" ] ;;
+    Pods)                 [ -f "$p/Podfile" ] ;;
+    vendor)               [ -f "$p/composer.json" ] ;;
+    .dart_tool)           [ -f "$p/pubspec.yaml" ] ;;
+    .build)               [ -f "$p/Package.swift" ] ;;
+    .zig-cache|zig-cache|zig-out) [ -f "$p/build.zig" ] ;;
+    _build|.elixir_ls|.elixir-tools|.lexical) [ -f "$p/mix.exs" ] ;;
+    .stack-work)          [ -f "$p/stack.yaml" ] ;;
+    dist-newstyle)        [ -f "$p/cabal.project" ] || any "$p"/*.cabal ;;
+    elm-stuff)            [ -f "$p/elm.json" ] ;;
+    bin|obj)              any "$p"/*.csproj || any "$p"/*.fsproj || any "$p"/*.vbproj ;;
+    Library|Temp)         [ -f "$p/Assembly-CSharp.csproj" ] ;;                      # Unity
+    Binaries|Intermediate|DerivedDataCache) any "$p"/*.uproject ;;                   # Unreal
+    .godot)               [ -f "$p/project.godot" ] ;;
+    .terraform)           [ -f "$p/.terraform.lock.hcl" ] ;;
+    .pixi)                [ -f "$p/pixi.toml" ] ;;
+    *) return 0 ;;        # Python bytecode and tool caches: always safe
+  esac
+}
+
+# Was any source file in project $1 edited in the last $2 days? (Build folders and hidden folders don't count.)
+active() {
+  local n x=()
+  for n in $BUILD_NAMES; do x+=(-o -name "$n"); done
+  [ -n "$(find "$1" -mindepth 1 -maxdepth 3 \( -name '.*' "${x[@]}" \) -prune -o -type f -mtime -"$2" -print -quit 2>/dev/null)" ]
+}
+
+project_builds() {
+  local n x=() prev= grp=() name d p kept=0 tracked=0
+  [ ${#ROOTS[@]} -gt 0 ] || return
+  for n in $BUILD_NAMES; do x+=(-o -name "$n"); done
+  while IFS=$'\t' read -r name d; do
+    p=${d%/*}
+    owned "$name" "$p" || continue
+    case $PY_CACHES in *" $name "*) ;;
+      *) if [ "$OLDER" -gt 0 ] && active "$p" "$OLDER"; then kept=$((kept + 1)); continue; fi
+         if command -v git >/dev/null && [ -n "$(git -C "$p" ls-files -- "$name" 2>/dev/null | head -1)" ]; then
+           tracked=$((tracked + 1)); continue     # committed to git: deleting it would dirty the repo
+         fi
+         # Your own data inside: a nested git repo, or keys (Solana/Anchor keeps program keys in target/deploy).
+         if [ -n "$(find "$d" -maxdepth 3 \( -name .git -o -name '*-keypair.json' \) -print -quit 2>/dev/null)" ]; then
+           tracked=$((tracked + 1)); continue
+         fi ;;
+    esac
+    if [ "$name" != "$prev" ] && [ ${#grp[@]} -gt 0 ]; then item "$prev (${#grp[@]})" "${grp[@]}"; grp=(); fi
+    prev=$name; grp+=("$d")
+  done < <(find "${ROOTS[@]}" -type d \( "${x[@]:1}" \) -print -prune \
+             -o -type d \( -name '.*' -o -path "$HOME/Library" \) -prune 2>/dev/null | awk -F/ '{print $NF "\t" $0}' | sort)
+  [ ${#grp[@]} -gt 0 ] && item "$prev (${#grp[@]})" "${grp[@]}"
+  [ $kept -gt 0 ] && KEPT_NOTE="$kept build folders kept: their projects were edited in the last $OLDER days (--older 0 to include them)"
+  [ $tracked -gt 0 ] && KEPT_NOTE="${KEPT_NOTE:+$KEPT_NOTE; }$tracked kept because they are in git or hold a repo or keys"
+}
+
+scan() {
+  section "Package managers" dl
+  item "npm cache"            ~/.npm/_cacache ~/.npm/_logs ~/.npm/_prebuilds
+  GUARDF=/_npx/ item "npx packages" ~/.npm/_npx            # MCP servers and other tools run from here
+  item "pnpm store"           "$PNPM" -- pnpm store prune
+  collect "pnpm metadata cache" < <(for d in "$C/pnpm"/*; do [ "${d##*/}" = dlx ] || echo "$d"; done)   # dlx: running pnpm dlx tools
+  item "Corepack downloads"   ~/.cache/node/corepack
+  item "Yarn cache"           "$C/$YARN"
+  item "Bun cache"            ~/.bun/install/cache
+  item "Deno cache"           "$C/deno"/{deps,npm,gen,remote}   # not location_data: that is app localStorage
+  item "uv cache"             ~/.cache/uv -- uv cache clean
+  item "pip / Pipenv cache"   "$C/pip" ~/.cache/pip "$C/pipenv"
+  item "Poetry cache"         "$C/pypoetry/cache" "$C/pypoetry/artifacts"
+  NEEDCMD=1 item "Conda packages" ~/miniconda3/pkgs ~/anaconda3/pkgs ~/miniforge3/pkgs ~/mambaforge/pkgs ~/.conda/pkgs -- conda clean --all --yes
+  item "Composer cache"       "$C/composer"
+  item "Homebrew"             "$C/Homebrew" -- brew cleanup --prune=all
+  item "Go modules"           ~/go/pkg/mod -- go clean -modcache
+  BACK=auto item "Go build/tools" "$C/go-build" "$C/goimports" "$C/gopls"
+  item "Cargo registry"       ~/.cargo/registry/cache ~/.cargo/registry/src ~/.cargo/git/checkouts
+  item "Gradle caches"        ~/.gradle/caches ~/.gradle/daemon ~/.gradle/wrapper/dists
+  item "Maven wrapper"        ~/.m2/wrapper
+  item "sbt / Coursier cache" ~/.ivy2/cache "$C/Coursier" "$C/coursier"
+  item "mise downloads"       "$C/mise" -- mise cache clear
+  item "rustup downloads"     ~/.rustup/downloads ~/.rustup/tmp
+  item "pyenv downloads"      ~/.pyenv/cache
+  item "Ruby download caches" ~/.rbenv/cache ~/.bundle/cache ~/.gem/specs
+  item "Hex / opam downloads" ~/.hex/cache ~/.opam/download-cache
+  item "NuGet packages"       ~/.nuget/packages
+  item "Dart / Flutter pub"   ~/.pub-cache/hosted ~/.pub-cache/git
+  item "CocoaPods cache"      "$C/CocoaPods"
+  item "Terraform plugins"    ~/.terraform.d/plugin-cache
+
+  section "Build & test tools" dl
+  BACK="manual:npx playwright install" item "Playwright browsers" "$C/ms-playwright"
+  BACK=build item "Puppeteer browsers" ~/.cache/puppeteer
+  BACK=build item "Cypress binaries"   "$C/Cypress"
+  item "Expo caches"          ~/.expo/{expo-go,android-apk-cache,ios-simulator-app-cache,native-modules-cache,schema-cache,template-cache,versions-cache}
+  BACK=auto item "Android build cache" ~/.android/build-cache ~/.android/cache
+  BACK=auto item "Python tool caches"  ~/.cache/ruff ~/.cache/mypy
+  BACK=auto item "PyInstaller cache"   "$S/pyinstaller" "$C/pyinstaller"
+  item "Lima / Vagrant downloads" "$C/lima/download" ~/.vagrant.d/tmp
+  BACK=auto item "GitHub CLI / kubectl caches" ~/.cache/gh ~/.kube/cache
+  BACK=gone item "Cloud CLI logs"      ~/.config/gcloud/logs ~/.azure/logs
+  BACK=dl collect "Obsolete editor extensions" < <(obsolete_extensions)
+  item "Electron caches"      "$C/electron" "$C/electron-builder"
+  item "node-gyp headers"     "$C/node-gyp" ~/.node-gyp
+  BACK=auto item "TypeScript cache" "$C/typescript"
+  item "Prisma engines"       ~/.cache/prisma
+  BACK=auto item "pre-commit envs"  ~/.cache/pre-commit
+  BACK=auto collect "Old JetBrains IDE caches" < <(old_jetbrains "$C/JetBrains")
+  if [ "$OS" = Darwin ]; then
+    local X=~/Library/Developer/Xcode d
+    BACK=auto GUARD=Xcode item "Xcode DerivedData" "$X/DerivedData" "$X/DocumentationCache" "$X/iOS Device Logs" \
+      ~/Library/Developer/CoreSimulator/Caches "$C/com.apple.dt.Xcode" "$X/UserData/IB Support"
+    BACK=auto GUARD=Xcode item "XCTest device clones" ~/Library/Developer/XCTestDevices
+    for d in "$X"/*DeviceSupport; do   # keep the newest 2: needed for connected devices
+      [ -d "$d" ] && collect "Old $(basename "$d")" < <(older "$d" 2)
+    done
+    if command -v xcrun >/dev/null && [ -d ~/Library/Developer/CoreSimulator/Devices ]; then
+      BACK=gone collect "Unavailable simulators" < <(xcrun simctl list devices unavailable 2>/dev/null |
+        grep -oE '[0-9A-F]{8}-([0-9A-F]{4}-){3}[0-9A-F]{12}' | sed "s|^|$HOME/Library/Developer/CoreSimulator/Devices/|")
+      CMD[N-1]=$(printf 'xcrun\x1fsimctl\x1fdelete\x1funavailable')
+    fi
+  fi
+
+  section "Apps" auto
+  item "Cursor caches"        "$S"/Cursor/{snapshots,CachedExtensionVSIXs,logs}
+  collect "Electron app caches" < <(electron_caches)
+  BACK=gone item "Editor logs"  "$S/Code/logs" "$S/Code - Insiders/logs"
+  GUARD=zed item "Zed caches"   "$C/Zed" "$C/zed" "$S/Zed/node/cache"
+  BACK=dl collect "Old Claude Code versions"  < <(older ~/.local/share/claude/versions 1 "$(readlink ~/.local/bin/claude)")
+  BACK=dl collect "Old Cursor Agent versions" < <(older ~/.local/share/cursor-agent/versions 1)
+  if [ "$OS" = Darwin ]; then
+    BACK=gone item "App logs"   ~/Library/Logs
+    collect "App update leftovers" < <(for d in "$C"/*.ShipIt "$C"/*/org.sparkle-project.Sparkle; do
+      [ -d "$d" ] && ! recent "$d" 1 && echo "$d"; done)   # updater downloads, untouched for a day (no update in progress)
+    BACK=dl item "iPhone/iPad update files" ~/Library/iTunes/iPhone\ Software\ Updates ~/Library/iTunes/iPad\ Software\ Updates
+    GUARD=Teams item "Microsoft Teams (classic) cache" "$S"/Microsoft/Teams/{Cache,"Application Cache","Code Cache",GPUCache,logs,tmp}
+    BACK=dl GUARD=Claude collect "Old Claude Desktop Claude Code" < <(older "$S/Claude/claude-code" 2; older "$S/Claude/claude-code-vm" 2)
+    # shellcheck disable=SC2010  # version folder names are plain numbers
+    BACK=dl collect "Old JetBrains Toolbox builds" < <(for ch in "$S"/JetBrains/Toolbox/apps/*/ch-*; do
+      [ -d "$ch" ] && ls -t "$ch" | grep -E '^[0-9][0-9.]*$' | tail -n +3 | sed "s|^|$ch/|"; done)   # newest 2 kept
+    BACK=gone collect "Old crash reports" < <(find "$S/CrashReporter" -type f -mtime +30 2>/dev/null)
+    BACK=dl item "Chrome updater downloads" "$S/Google/GoogleUpdater/crx_cache"
+    BACK=gone item "Crash reporter caches" "$C/SentryCrash" "$C/KSCrash"
+    GUARD=steam_osx item "Steam caches" "$S/Steam/htmlcache" "$S/Steam/logs" "$S/Steam/steamapps/shadercache"
+    BACK=gone item "Docker installer" "$S/com.docker.install"
+  else
+    item "Thumbnails"           "$C/thumbnails" ~/.thumbnails
+    GUARD=steam item "Steam caches" ~/.local/share/Steam/{htmlcache,logs,steamapps/shadercache}
+  fi
+
+  section "Docker" dl
+  progress "Docker"
+  if ! command -v docker >/dev/null; then :
+  elif docker info >/dev/null 2>&1; then
+    # Images no container uses and the build cache. Containers (even stopped ones) and volumes are kept.
+    SIZE=$(docker_kb) item "Docker images & build cache" -- sh -c 'docker image prune -a -f && docker builder prune -a -f'
+  else
+    L[N]="Docker" SEC[N]=$SECT K[N]=0 ST[N]=skip WHY[N]="not running" BK[N]=dl P[N]= CMD[N]=; N=$((N + 1))
+  fi
+
+  if [ -n "$DEEP" ]; then
+    section "Browser caches (history, logins and bookmarks are kept)" auto
+    if [ "$OS" = Darwin ]; then
+      GUARD=Arc              collect "Arc cache"     < <(echo "$C/Arc"; echo "$C/company.thebrowser.Browser"; chromium_leaves "$S/Arc/User Data")
+      GUARD="Google Chrome"  collect "Chrome cache"  < <(echo "$C/Google/Chrome"; chromium_leaves "$S/Google/Chrome")
+      GUARD=Chromium         collect "Chromium cache" < <(echo "$C/Chromium"; chromium_leaves "$S/Chromium")
+      GUARD="Brave Browser"  collect "Brave cache"   < <(echo "$C/BraveSoftware"; chromium_leaves "$S/BraveSoftware/Brave-Browser")
+      GUARD="Microsoft Edge" collect "Edge cache"    < <(echo "$C/Microsoft Edge"; chromium_leaves "$S/Microsoft Edge")
+      GUARD=Vivaldi          collect "Vivaldi cache" < <(echo "$C/Vivaldi"; chromium_leaves "$S/Vivaldi")
+      GUARD=firefox          item "Firefox cache"   "$C/Firefox"
+      GUARD=Safari           item "Safari cache"    "$C/com.apple.Safari"
+      GUARD=Arc       BACK=dl item "Arc AI model"    "$S/Arc/User Data/OptGuideOnDeviceModel"
+      GUARD="Google Chrome" BACK=dl item "Chrome AI model" "$S/Google/Chrome/OptGuideOnDeviceModel"
+    else
+      GUARD=chrome   collect "Chrome cache"   < <(echo "$C/google-chrome"; chromium_leaves "$S/google-chrome")
+      GUARD=chromium collect "Chromium cache" < <(echo "$C/chromium"; chromium_leaves "$S/chromium")
+      GUARD=brave    collect "Brave cache"    < <(echo "$C/BraveSoftware"; chromium_leaves "$S/BraveSoftware/Brave-Browser")
+      GUARD=msedge   collect "Edge cache"     < <(echo "$C/microsoft-edge"; chromium_leaves "$S/microsoft-edge")
+      GUARD=vivaldi-bin collect "Vivaldi cache" < <(echo "$C/vivaldi"; chromium_leaves "$S/vivaldi")
+      GUARD=firefox item "Firefox cache"   "$C/mozilla"
+      GUARD=chrome BACK=dl item "Chrome AI model" "$S/google-chrome/OptGuideOnDeviceModel"
+    fi
+
+    section "Idle app caches" auto
+    collect "Caches unused for a week" < <(idle_caches)
+    if [ "$OS" = Darwin ]; then   # Adobe media caches: large, rebuild slowly, so only when idle for a week
+      collect "Adobe caches unused for a week" < <(for d in "$C/Adobe" "$S/Adobe/Common/Media Cache Files" "$S/Adobe/Common/Media Cache"; do
+        [ -d "$d" ] && ! recent "$d" 7 && echo "$d"; done)
+    fi
+
+    section "Trash" gone
+    if [ "$OS" = Darwin ]; then
+      if ls ~/.Trash >/dev/null 2>&1; then collect "Trash" < <(find ~/.Trash -mindepth 1 -maxdepth 1 2>/dev/null)
+      else L[N]="Trash" SEC[N]=$SECT K[N]=0 ST[N]=skip WHY[N]="give your terminal Full Disk Access" BK[N]=gone P[N]= CMD[N]=; N=$((N + 1))
+      fi
+    else
+      item "Trash" ~/.local/share/Trash/files ~/.local/share/Trash/info
+    fi
+
+    section "Project builds ($(for r in "${ROOTS[@]}"; do printf '%s ' "$(tilde "$r")"; done | sed 's/ $//'))" build
+    project_builds
+  fi
+}
+
+note() {  # report a path without deleting it, if it's over 100M
+  local k; k=$(kb "${@:2}")
+  [ "$k" -gt 102400 ] && printf "  ${D}·${R}  %-30s %7s  ${D}%s${R}\n" "$1" "$(human "$k")" "$(tilde "$2")"
+}
+
+notes() {
+  echo; echo "${B}Worth a look yourself${R}  ${D}(never deleted here; clean --review goes through them)${R}"
+  note "Downloads"              ~/Downloads
+  [ -z "$DEEP" ] && note "Trash" ~/.Trash ~/.local/share/Trash
+  note "iOS device backups"     "$S/MobileSync/Backup"
+  note "Xcode archives"         ~/Library/Developer/Xcode/Archives
+  note "Ollama models"          ~/.ollama
+  note "Hugging Face models"    ~/.cache/huggingface
+  note "Node versions (nvm)"    ~/.nvm/versions
+  note "Android emulators"      ~/.android/avd
+  note "Maven repository"       ~/.m2/repository
+  [ "$OS" = Darwin ] && [ "$(uname -m)" = arm64 ] &&
+    note "Intel Homebrew (x86)" /usr/local/Homebrew /usr/local/Cellar /usr/local/Caskroom
+  local n; n=$(tmutil listlocalsnapshots / 2>/dev/null | grep -c com.apple)
+  [ "${n:-0}" -gt 0 ] && printf "  ${D}·${R}  %-30s %7s  ${D}free with: tmutil thinlocalsnapshots / 999999999999 4${R}\n" "Time Machine local snapshots" "$n"
+  [ -z "$DEEP" ] && echo "  ${D}Run clean --deep for browser caches, idle app caches, the Trash and old project builds.${R}"
+}
+
+back_text() {
+  case $1 in
+    auto)  echo "rebuilds itself" ;;
+    dl)    echo "re-downloads when needed" ;;
+    build) echo "comes back on your next install/build" ;;
+    gone)  echo "${Y}permanent${R}" ;;
+    manual:*) echo "${Y}comes back with: ${1#manual:}${R}" ;;
+  esac
+}
+
+# ---------------------------------------------------------------- run
+lock_and_roots() {
+  [ -n "$DRY" ] || lock
+  if [ -n "$DEEP" ]; then
+    local d r seen=
+    [ ${#DIRS[@]} -gt 0 ] || DIRS=("${CDIRS[@]}")
+    [ ${#DIRS[@]} -gt 0 ] || DIRS=(~/Desktop ~/Documents ~/Developer ~/Development ~/code ~/Code ~/dev ~/projects ~/Projects
+                                    ~/src ~/repos ~/Repos ~/GitHub ~/work ~/Workspace ~/workspace ~/www)
+    for d in "${DIRS[@]}"; do
+      r=$(cd -P "$d" 2>/dev/null && pwd -P) || continue
+      [ "$r" = / ] && die "refusing to search /"
+      case "$seen" in *$'\n'"$r"$'\n'*) continue ;; esac
+      seen="$seen"$'\n'"$r"$'\n'; ROOTS+=("$r")
+    done
+    [ ${#ROOTS[@]} -gt 0 ] || warn "no code folders found; pass one with --deep DIR or set deep_dir in cleanspace --config"
+  fi
 }
 
 if [ "$ACTION" = --review ]; then
-  [ -n "$DRY" ] || [ -r /dev/tty ] || { echo "--review needs an interactive terminal"; exit 1; }
+  [ -n "$DRY" ] || [ -n "$ASK" ] || die "--review needs an interactive terminal"
+  lock_and_roots
   trashed=0
+
+  pick() {   # ask about each entry of dir $1 over 100M, biggest first.  $2 = trash | delete
+    [ -d "$1" ] || return
+    local k p
+    while IFS=$'\t' read -r k p; do
+      [ "$k" -gt 102400 ] || break
+      ask "  $(printf '%7s' "$(human "$k")")  $(tilde "$p")  → $2?" || continue
+      if [ "$2" = trash ]; then totrash "$p" && trashed=$(( trashed + k ))
+      else rm -rf "$p" && total=$(( total + k )); fi
+    done < <(du -sk "$1"/* 2>/dev/null | sort -rn)
+  }
+
   echo "${B}Downloads${R}  ${D}(moved to Trash, so you can still restore them)${R}"
   pick ~/Downloads trash
 
@@ -153,12 +741,13 @@ if [ "$ACTION" = --review ]; then
   if [ -d "$nv" ]; then
     echo; echo "${B}Node versions (nvm)${R}"
     def=$(cat ~/.nvm/alias/default 2>/dev/null)
-    defv=$(ls "$nv" | grep "^v${def#v}" | sort -V | tail -1)   # the version nvm's default resolves to
-    for v in $(ls "$nv"); do
+    defv=$(for vp in "$nv/v${def#v}"*; do [ -d "$vp" ] && basename "$vp"; done | sort -V | tail -1)   # what nvm's default resolves to
+    for vp in "$nv"/*/; do
+      v=$(basename "$vp")
       case $(command -v node) in "$nv/$v/"*) printf "  ${D}·  %-8s in use, kept${R}\n" "$v"; continue ;; esac
       tag=; [ -n "$def" ] && [ "$v" = "$defv" ] && tag="  ${Y}(nvm default)${R}"
-      ask "  $(printf '%7s' "$(human $(kb "$nv/$v"))")  Node $v$tag → delete?" || continue
-      k=$(kb "$nv/$v"); rm -rf "$nv/$v" && total=$(( total + k ))
+      ask "  $(printf '%7s' "$(human "$(kb "$nv/$v")")")  Node $v$tag → delete?" || continue
+      k=$(kb "$nv/$v"); rm -rf "${nv:?}/$v" && total=$(( total + k ))
     done
   fi
 
@@ -167,9 +756,9 @@ if [ "$ACTION" = --review ]; then
     only=$(comm -23 <( (ls /usr/local/Cellar; ls /usr/local/Caskroom) 2>/dev/null | sort) \
                     <( (ls /opt/homebrew/Cellar; ls /opt/homebrew/Caskroom) 2>/dev/null | sort) | tr '\n' ' ')
     echo "  Not installed in /opt/homebrew: ${only:-nothing}"
-    if ask "  $(printf '%7s' "$(human $(kb /usr/local/Homebrew /usr/local/Cellar /usr/local/Caskroom))")  Uninstall it with Homebrew's official uninstaller (asks for your password)?"; then
+    if ask "  $(printf '%7s' "$(human "$(kb /usr/local/Homebrew /usr/local/Cellar /usr/local/Caskroom)")")  Uninstall it with Homebrew's official uninstaller (asks for your password)?"; then
       u=$(mktemp) && curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/uninstall.sh -o "$u" &&
-        /bin/bash "$u" --path=/usr/local </dev/tty; rm -f "$u"
+        /bin/bash "$u" --path=/usr/local <"$IN"; rm -f "$u"
     fi
   fi
 
@@ -179,138 +768,128 @@ if [ "$ACTION" = --review ]; then
   pick ~/.cache/huggingface/hub           delete   # downloaded AI models
   pick ~/.android/avd                     delete   # Android emulators
 
+  echo; echo "${B}Large files untouched for 6 months${R}  ${D}(over 1G, outside hidden and app folders; moved to Trash)${R}"
+  progress "large files"
+  while IFS= read -r f; do
+    k=$(kb "$f")
+    ask "$EL  $(printf '%7s' "$(human "$k")")  $(tilde "$f")  → trash?" && totrash "$f" && trashed=$(( trashed + k ))
+  done < <(find "$HOME" -xdev \( -name '.*' -o -path "$HOME/Library" -o -path "$HOME/Downloads" -o -type d -name '*.*' \) -prune \
+             -o -type f -size +1G -mtime +180 -print 2>/dev/null)
+  [ -n "$VIS" ] && printf %s "$EL"
+
   echo; echo "${B}Deleted:${R} ${G}$(human $total)${R}   ${B}Moved to Trash:${R} $(human $trashed)  ${D}(empty the Trash to free it)${R}"
+  [ -z "$DRY" ] && [ "$total" -gt 0 ] && mkdir -p "$STATE" && printf '%s\treview\t%s\t%s\n' "$(date +%s)" "$total" "$total" >> "$HIST"
   exit
 fi
 
+if [ -n "$AUTO" ]; then
+  mkdir -p "$STATE"
+  [ -f "$STATE/auto.log" ] && [ "$(wc -c < "$STATE/auto.log")" -gt 1000000 ] &&
+    tail -n 500 "$STATE/auto.log" > "$STATE/auto.log.tmp" && mv -f "$STATE/auto.log.tmp" "$STATE/auto.log"
+  echo "== $(date '+%F %T') =="
+  if [ "$(freekb)" -ge $(( AUTO_GB * 1048576 )) ]; then
+    echo "$(diskfree): above the ${AUTO_GB}G limit, nothing to do"; exit 0
+  fi
+fi
+
+lock_and_roots
 echo "${B}Before:${R} $(diskfree)${DRY:+  ${Y}(dry run, nothing is deleted)${R}}"
+scan
+[ -n "$VIS" ] && printf %s "$EL"
 
-echo; echo "${B}Package managers${R}"
-item "npm cache"            ~/.npm/_cacache ~/.npm/_npx ~/.npm/_logs ~/.npm/_prebuilds
-item "pnpm store"           "$PNPM" "$C/pnpm"
-item "Yarn cache"           "$C/$YARN"
-item "Bun cache"            ~/.bun/install/cache
-item "uv cache"             ~/.cache/uv -- uv cache clean
-item "pip / Poetry cache"   "$C/pip" "$C/pypoetry"
-item "Composer cache"       "$C/composer"
-item "Homebrew"             "$C/Homebrew" -- brew cleanup --prune=all
-item "Go modules"           ~/go/pkg/mod -- go clean -modcache
-item "Go build/tools"       "$C/go-build" "$C/goimports" "$C/gopls"
-item "Cargo download cache" ~/.cargo/registry/cache
-item "Gradle caches"        ~/.gradle/caches
-item "CocoaPods cache"      "$C/CocoaPods"
-
-echo; echo "${B}Build & test tools${R}"
-item "Playwright browsers"  "$C/ms-playwright"
-item "Puppeteer browsers"   ~/.cache/puppeteer
-item "Electron caches"      "$C/electron" "$C/electron-builder"
-item "node-gyp headers"     "$C/node-gyp"
-item "TypeScript cache"     "$C/typescript"
-item "Prisma engines"       ~/.cache/prisma
-if [ "$OS" = Darwin ]; then
-  X=~/Library/Developer/Xcode
-  item "Xcode DerivedData"    "$X/DerivedData" "$X/DocumentationCache" "$X/iOS Device Logs"
-  for d in "$X"/*DeviceSupport; do   # keep newest 2: needed for connected devices
-    [ -d "$d" ] && collect "Old $(basename "$d")" < <(older "$d" 2)
-  done
-  if [ -d ~/Library/Developer/CoreSimulator ] && [ -z "$DRY" ]; then
-    xcrun simctl delete unavailable 2>/dev/null && printf "  ${G}✓${R}  %-28s\n" "Unavailable simulators"
+# ---------------------------------------------------------------- plan
+TODO=() plan_kb=0 nclean=0 nexcl=0 last=
+for ((i = 0; i < N; i++)); do
+  case ${ST[i]} in clean) nclean=$((nclean + 1)); continue ;; excluded) nexcl=$((nexcl + 1)); continue ;; esac
+  [ "${SEC[i]}" != "$last" ] && { echo; echo "${B}${SEC[i]}${R}"; last=${SEC[i]}; }
+  if [ "${ST[i]}" = skip ]; then
+    if [ "${K[i]}" -gt 0 ]; then size=$(human "${K[i]}"); else size=; fi
+    printf "  ${D}·    %-30s %7s  skipped: %s${R}\n" "${L[i]}" "$size" "${WHY[i]}"; continue
   fi
+  TODO+=("$i"); plan_kb=$((plan_kb + K[i]))
+  printf "  ${D}%3s${R}  %-30s ${B}%7s${R}  ${D}%s${R}\n" "${#TODO[@]}" "${L[i]}" "$(human "${K[i]}")" "$(back_text "${BK[i]}")"
+done
+[ -n "${KEPT_NOTE:-}" ] && echo "  ${D}·    $KEPT_NOTE${R}"
+echo
+extra=; [ $nclean -gt 0 ] && extra="$nclean already clean"
+[ $nexcl -gt 0 ] && extra="${extra:+$extra, }$nexcl excluded in config"
+[ -n "$extra" ] && echo "${D}($extra)${R}"
+
+if [ ${#TODO[@]} -eq 0 ]; then
+  echo "${G}Nothing to clean.${R}"
+  [ -z "$AUTO" ] && notes
+  exit 0
 fi
 
-echo; echo "${B}Apps${R}"
-item "Cursor caches"        "$S"/Cursor/{snapshots,CachedExtensionVSIXs,logs}
-collect "Electron app caches" < <(find "$S" -mindepth 2 -maxdepth 2 -type d \( -name Cache -o -name "Code Cache" \
-  -o -name GPUCache -o -name CachedData -o -name DawnGraphiteCache -o -name GraphiteDawnCache \
-  -o -name DawnWebGPUCache -o -name ShaderCache \) 2>/dev/null)
-collect "Old Claude Code versions" < <(older ~/.local/share/claude/versions 1 "$(readlink ~/.local/bin/claude)")
-collect "Old Cursor Agent versions" < <(older ~/.local/share/cursor-agent/versions 1)
-if [ "$OS" = Darwin ]; then
-  item "App logs"             ~/Library/Logs
-  item "Cursor update files"  "$C/com.todesktop.230313mzl4w4u92.ShipIt"
-  item "Docker installer"     "$S/com.docker.install"
-else
-  item "Thumbnails"           "$C/thumbnails" ~/.thumbnails
+if [ -n "$DRY" ]; then
+  echo "${B}Would free:${R} ${G}$(human $plan_kb)${R} across ${#TODO[@]} items. Nothing was deleted."
+  notes; exit 0
 fi
 
-echo; echo "${B}Docker${R}"
-if ! docker info >/dev/null 2>&1; then
-  printf "  ${D}·  Docker not running, skipped${R}\n"
-elif [ -n "$DRY" ]; then
-  printf "  ${Y}○${R}  %-28s ${D}would prune unused images, containers, build cache${R}\n" "docker system prune -a"
-else
-  out=$(mktemp)
-  spin "docker system prune -a  removing..." sh -c "docker system prune -a -f > $out 2>&1"
-  printf "\r\033[K  ${G}✓${R}  %-28s ${B}%7s${R} reclaimed\n" "docker system prune -a" \
-    "$(awk -F': ' '/reclaimed/ {print $2}' $out)"
-  rm -f $out
-fi
-
-if [ -n "$DEEP" ]; then
-  echo; echo "${B}Browser caches${R}  ${D}(cache only: history, logins and bookmarks are kept)${R}"
-  if [ "$OS" = Darwin ]; then
-    GUARD=Arc              item "Arc cache"       "$C/Arc" "$C/company.thebrowser.Browser"
-    GUARD="Google Chrome"  item "Chrome cache"    "$C/Google/Chrome"
-    GUARD="Brave Browser"  item "Brave cache"     "$C/BraveSoftware"
-    GUARD="Microsoft Edge" item "Edge cache"      "$C/Microsoft Edge"
-    GUARD=firefox          item "Firefox cache"   "$C/Firefox"
-    GUARD=Arc              item "Arc AI model"    "$S/Arc/User Data/OptGuideOnDeviceModel"
-    GUARD="Google Chrome"  item "Chrome AI model" "$S/Google/Chrome/OptGuideOnDeviceModel"
-  else
-    GUARD=chrome  item "Chrome cache"    "$C/google-chrome" "$C/chromium"
-    GUARD=brave   item "Brave cache"     "$C/BraveSoftware"
-    GUARD=firefox item "Firefox cache"   "$C/mozilla"
-    GUARD=chrome  item "Chrome AI model" "$S/google-chrome/OptGuideOnDeviceModel"
+if [ -z "$YES" ]; then
+  if [ -z "$ASK" ]; then
+    echo "Not running in a terminal, so nothing was deleted. Add --yes to clean without asking." >&2; exit 2
   fi
-
-  echo; echo "${B}Trash${R}"
-  if [ "$OS" = Darwin ]; then
-    ls ~/.Trash >/dev/null 2>&1 || printf "  ${Y}·${R}  %-28s ${D}give your terminal Full Disk Access to clean it${R}\n" "Trash"
-    collect "Trash" < <(find ~/.Trash -mindepth 1 -maxdepth 1 2>/dev/null)
-  else
-    item "Trash" ~/.local/share/Trash/files ~/.local/share/Trash/info
-  fi
-
-  # Only delete build folders that sit next to their project file (like kondo), so a
-  # random folder named "target" or "vendor" is never touched. Hidden dirs are skipped.
-  echo; echo "${B}Project builds (${DIR/#$HOME/$T})${R}"
-  prev= group=()
-  while IFS=$'\t' read -r name d; do
-    p=$(dirname "$d")
-    case $name in
-      node_modules|.next|.nuxt|.svelte-kit|.angular|.astro|.expo|.turbo|.parcel-cache)
-                 [ -f "$p/package.json" ] || continue ;;
-      target)    [ -f "$p/Cargo.toml" ] || [ -f "$p/pom.xml" ] || continue ;;
-      .gradle)   ls "$p"/build.gradle* "$p"/settings.gradle* >/dev/null 2>&1 || continue ;;
-      Pods)      [ -f "$p/Podfile" ] || continue ;;
-      vendor)    [ -f "$p/composer.json" ] || continue ;;
+  while :; do
+    printf "${B}Clean %s items (%s)?${R} ${D}Enter = yes · numbers to skip, e.g. 2 5 · n = cancel:${R} " "${#TODO[@]}" "$(human $plan_kb)"
+    read -r ans <"$IN" || { echo; echo "Cancelled. Nothing was deleted."; exit 0; }
+    ans=${ans//,/ }
+    case $ans in
+      ""|y|Y|yes) break ;;
+      n|N|no|q) echo "Cancelled. Nothing was deleted."; exit 0 ;;
     esac
-    if [ "$name" != "$prev" ] && [ ${#group[@]} -gt 0 ]; then
-      item "$prev (${#group[@]})" "${group[@]}"; group=()
-    fi
-    prev=$name
-    group+=("$d")
-  done < <(find "$DIR" -type d \( -name node_modules -o -name .next -o -name .nuxt -o -name .svelte-kit \
-      -o -name .angular -o -name .astro -o -name .expo -o -name .turbo -o -name .parcel-cache \
-      -o -name target -o -name .gradle -o -name Pods -o -name vendor -o -name __pycache__ \
-      -o -name .pytest_cache -o -name .mypy_cache -o -name .ruff_cache -o -name .tox \) -print -prune \
-      -o -type d -name '.*' -prune 2>/dev/null | awk -F/ '{print $NF "\t" $0}' | sort)
-  [ ${#group[@]} -gt 0 ] && item "$prev (${#group[@]})" "${group[@]}"
+    bad=
+    for x in $ans; do [[ $x =~ ^[0-9]+$ ]] && [ "$x" -ge 1 ] && [ "$x" -le ${#TODO[@]} ] || bad=$x; done
+    [ -n "$bad" ] && { echo "  '$bad' is not an item number from the list above."; continue; }
+    for x in $ans; do ST[TODO[x - 1]]=skip; echo "  ${D}skipping ${L[TODO[x - 1]]}${R}"; done
+    break
+  done
 fi
 
-echo; echo "${B}Worth a look yourself${R}  ${D}(never deleted here; run cleanspace --review to go through them)${R}"
-note "Downloads"              ~/Downloads
-note "Trash"                  ~/.Trash ~/.local/share/Trash
-note "iOS device backups"     "$S/MobileSync/Backup"
-note "Xcode archives"         ~/Library/Developer/Xcode/Archives
-note "Ollama models"          ~/.ollama
-note "Hugging Face models"    ~/.cache/huggingface
-note "Node versions (nvm)"    ~/.nvm/versions
-note "Android emulators"      ~/.android/avd
-[ "$OS" = Darwin ] && [ "$(uname -m)" = arm64 ] &&
-  note "Intel Homebrew (x86)" /usr/local/Homebrew /usr/local/Cellar /usr/local/Caskroom
-n=$(tmutil listlocalsnapshots / 2>/dev/null | grep -c com.apple)
-[ "${n:-0}" -gt 0 ] && printf "  ${D}·${R}  %-28s %7s  ${D}free with: tmutil thinlocalsnapshots / 999999999999 4${R}\n" "Time Machine local snapshots" "$n"
+# ---------------------------------------------------------------- clean
+run_item() {
+  local i=$1 paths=() cmd=() before=${K[$1]} after freed rc msg
+  [ -n "${P[i]}" ] && IFS=$'\n' read -d '' -r -a paths < <(printf '%s' "${P[i]}")
+  [ -n "${CMD[i]}" ] && IFS=$'\x1f' read -d '' -r -a cmd < <(printf '%s' "${CMD[i]}")
+  msg=$(printf "%-30s %7s  removing…" "${L[i]}" "$(human "$before")")
+  if [ ${#cmd[@]} -gt 0 ] && command -v "${cmd[0]}" >/dev/null; then
+    spin "$msg" "${cmd[@]}"; rc=$?
+  elif [ ${#paths[@]} -gt 0 ]; then
+    spin "$msg" rm -rf "${paths[@]}"; rc=$?
+    if [ $rc -ne 0 ]; then   # read-only trees (the Go module cache): make them writable and try once more
+      chmod -R u+w "${paths[@]}" 2>/dev/null; spin "$msg" rm -rf "${paths[@]}"; rc=$?
+    fi
+  else rc=1; fi
+  if [ ${#paths[@]} -gt 0 ]; then after=$(kb "${paths[@]}"); freed=$((before - after))
+  elif [ $rc -eq 0 ]; then after=0 freed=$before
+  else after=$before freed=0; fi
+  [ $freed -lt 0 ] && freed=0
+  total=$((total + freed))
+  HROWS="$HROWS$NOW    ${L[i]% (*}    $before    $freed"$'\n'
+  if [ $rc -ne 0 ] && [ "$after" -gt 0 ]; then
+    FAILED=$((FAILED + 1))
+    printf "%s  ${Y}!${R}  %-30s ${B}%7s${R} freed  ${D}%s left: in use or protected${R}\n" "$EL" "${L[i]}" "$(human $freed)" "$(human "$after")"
+  else
+    printf "%s  ${G}✓${R}  %-30s ${B}%7s${R} freed\n" "$EL" "${L[i]}" "$(human $freed)"
+  fi
+}
 
-echo; echo "${B}Total ${DRY:+that would be }freed:${R} ${G}$(human $total)${R}  ${D}(Docker counted separately)${R}"
-echo "${B}After:${R}  $(diskfree)"
+NOW=$(date +%s) HROWS= FAILED=0 before_df=$(diskfree) RUNNING=1
+echo
+for i in "${TODO[@]}"; do [ "${ST[i]}" = todo ] && run_item "$i"; done
+RUNNING=
+[ -n "$HROWS" ] && mkdir -p "$STATE" && printf %s "$HROWS" >> "$HIST"
+
+echo
+echo "${B}Freed:${R} ${G}$(human $total)${R}"
+echo "${B}Disk:${R}  $before_df  →  $(diskfree)"
+[ $FAILED -gt 0 ] && echo "${D}$FAILED item(s) were only partly removed; quit the apps using them and run clean again.${R}"
+case " ${BK[*]} " in *" build "*) [ -n "$DEEP" ] && echo "${D}Project folders come back with your usual install or build command (npm install, cargo build, ...).${R}" ;; esac
+if [ -n "$AUTO" ]; then
+  if [ "$(freekb)" -lt $(( AUTO_GB * 1048576 )) ]; then
+    notify "Freed $(human $total), but space is still low. Run clean --review to find large personal files."
+  else notify "Freed $(human $total). $(diskfree)."; fi
+else
+  notes
+fi
+exit 0

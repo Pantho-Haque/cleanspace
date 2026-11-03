@@ -1,0 +1,39 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  unix:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then brew install shellcheck; fi
+          shellcheck -s bash -S warning cleanspace install.sh tests/run.sh
+      - name: tests (macOS runs them with the system bash 3.2)
+        run: /bin/bash tests/run.sh
+      - name: dry run on the runner
+        run: ./cleanspace --dry-run --deep "$PWD"
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell   # Windows PowerShell 5.1, what every Windows 10/11 machine has
+    steps:
+      - uses: actions/checkout@v4
+      - name: parse check
+        run: |
+          foreach ($f in 'cleanspace.ps1', 'install.ps1', 'tests\run.ps1') {
+            $e = $null; [void][Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f), [ref]$null, [ref]$e)
+            if ($e.Count) { $e; exit 1 }
+          }
+      - name: tests
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests\run.ps1
+      - name: dry run on the runner
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File cleanspace.ps1 --dry-run --deep $PWD
+      - name: tests under PowerShell 7
+        shell: pwsh
+        run: pwsh -NoProfile -File tests/run.ps1
