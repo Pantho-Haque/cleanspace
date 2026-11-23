@@ -92,7 +92,7 @@ Exit codes: `0` done, `1` error, `2` confirmation needed (no terminal, use `--ye
 | Build and test tools | Playwright, Puppeteer and Cypress browsers, Electron, node-gyp, TypeScript, Prisma engines, pre-commit envs, old JetBrains IDE caches (newest per IDE kept) |
 | Xcode (macOS) | DerivedData (skipped while Xcode runs), documentation cache, device logs, simulator caches, old DeviceSupport (newest 2 kept), unavailable simulators |
 | Editors and apps | Cursor caches, Electron app caches (Slack, Discord, VS Code, Postman, ...), classic Teams cache, old Claude Code and Cursor Agent versions, app logs, app updater leftovers (ShipIt, Sparkle), downloaded iPhone/iPad update files |
-| Docker | Unused images and build cache. Containers and volumes are kept. |
+| Docker | Unused images and build cache. Containers and volumes are kept. If Docker Desktop keeps more than 5 GB of build cache between cleans (its default is 20 GB), `clean` offers to cap it at 5 GB in `~/.docker/daemon.json`. |
 | Linux only | Thumbnail cache |
 
 ### `clean --deep`
@@ -101,7 +101,7 @@ Everything above, plus:
 
 | Category | Items |
 | --- | --- |
-| Browser caches | Arc, Chrome, Chromium, Brave, Edge, Firefox, Safari, Vivaldi: the disk cache only, and only while the browser is closed |
+| Browser caches | Arc, Chrome, Chromium, Brave, Edge, Firefox, Safari, Vivaldi: the disk cache only, and only while the browser is closed. On macOS, `clean` offers to quit a running browser holding over 100 MB of cache and reopens it afterwards (your tabs come back). |
 | Browser AI models | The on-device model Chrome and Arc download (about 2.7 GB) |
 | Idle app caches | Cache folders no other rule covers that haven't changed in 7 days, plus Adobe media caches idle for 7 days. Apple's own caches are never touched. |
 | Trash | `~/.Trash` (macOS), `~/.local/share/Trash` (Linux) |
@@ -117,7 +117,8 @@ Everything above, plus:
 | Swift, Dart, Zig | `.build` / `.dart_tool` / `.zig-cache`, `zig-cache`, `zig-out` | `Package.swift` / `pubspec.yaml` / `build.zig` |
 | Elixir, Haskell, Elm | `_build`, `.elixir_ls`, `.elixir-tools`, `.lexical` / `.stack-work`, `dist-newstyle` / `elm-stuff` | `mix.exs` / `stack.yaml` or `*.cabal` / `elm.json` |
 | PHP, CocoaPods, Terraform, Pixi | `vendor` / `Pods` / `.terraform` / `.pixi` | `composer.json` / `Podfile` / `.terraform.lock.hcl` / `pixi.toml` |
-| Python | `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.tox`, `.nox`, `__pypackages__` | nothing (always safe) |
+| Python virtualenvs | `.venv`, `venv` (only real virtualenvs, with `pyvenv.cfg` inside) | `pyproject.toml`, `requirements.txt`, `Pipfile` or `setup.py` |
+| Python caches | `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.tox`, `.nox`, `__pypackages__` | nothing (always safe) |
 
 Code folders searched: the folder you pass, or `deep_dir` from the config, or whichever of `~/Desktop ~/Documents ~/Developer ~/code ~/dev ~/projects ~/src ~/repos ~/work` exist.
 
@@ -157,7 +158,7 @@ clean --schedule weekly   # check on Mondays
 clean --schedule off
 ```
 
-macOS uses a launchd agent (a run missed during sleep happens on wake). Linux uses a systemd user timer, or cron if systemd isn't available. Scheduled runs only clean the default tier, never `--deep` or `--review` items, and run at low priority. Output goes to `~/.local/state/cleanspace/auto.log`. A notification tells you what was freed, and suggests `clean --review` if space is still low.
+macOS uses a launchd agent (a run missed during sleep happens on wake). Linux uses a systemd user timer, or cron if systemd isn't available. Scheduled runs only clean the default tier, never `--deep` or `--review` items, and run at low priority. Output goes to `~/.local/state/cleanspace/auto.log`. macOS doesn't let launchd jobs read `~/Desktop`, `~/Documents`, `~/Downloads` or iCloud Drive, so if your script lives there (a dev checkout), the schedule runs a copy in `~/.local/state/cleanspace/`, which every manual run keeps up to date. A notification tells you what was freed, and suggests `clean --review` if space is still low.
 
 ## Configuration
 
@@ -178,7 +179,7 @@ The safety rules are adapted from [Mole](https://github.com/tw93/Mole) and [kond
 - **Plan first.** Nothing is deleted before you've seen the list and agreed. Without a terminal, `--yes` is required.
 - **Personal data is never removed automatically.** It only appears in `--review`, one item at a time.
 - **Browser profiles are untouched.** History, passwords, cookies and bookmarks stay, and you stay signed in.
-- **Running apps are skipped.** Browser caches and Xcode DerivedData are only cleared while the app is closed.
+- **Running apps are skipped.** Browser caches and Xcode DerivedData are only cleared while the app is closed. On macOS, `clean` can quit the app for you, but only after you answer `y`, and it reopens it afterwards. `--yes` and the schedule never quit anything.
 - **Build folders need their project file, must not be committed to git, and must belong to a project you haven't edited in 14 days.** A build folder with a git repo or a `*-keypair.json` inside is kept, so Solana program keys in `target/deploy` are safe. Hidden folders are never searched.
 - **Nothing in use is pulled out from under a program.** The npx cache is skipped while anything runs from it, such as an MCP server. The Deno cache keeps `location_data`, which holds app localStorage. `pnpm dlx` tools are kept.
 - **Honest about what comes back.** Playwright browsers say *comes back with: npx playwright install*, and the schedule never removes anything that needs a manual reinstall.
@@ -200,6 +201,9 @@ Downloads and large files go to the Trash so you can change your mind. Empty it,
 
 **What is "Intel Homebrew (x86)"?**
 On Apple Silicon, Homebrew lives in `/opt/homebrew`. A second copy in `/usr/local` is usually left over from an Intel Mac and runs through Rosetta. `clean --review` lists what is only installed there before offering to remove it.
+
+**Space keeps filling up again.**
+Run `clean --stats`: *Fastest to grow back* shows which caches refill quickest, so you know which app to rein in. On macOS, `clean` also reports swap when it's over 2 GB. Swap grows while memory is short and only shrinks on a restart.
 
 **What about system caches on Linux?**
 They need root, so they're left to you, for example `sudo apt clean` and `sudo journalctl --vacuum-time=2weeks`.

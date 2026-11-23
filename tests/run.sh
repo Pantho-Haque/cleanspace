@@ -65,7 +65,12 @@ check "Downloads untouched" exists "$H/Downloads/movie.mp4"
 check "excluded label kept" exists "$CACHE/composer/repo/x"
 check "lock released" gone "$H/.local/state/cleanspace/lock"
 check "history recorded" grep -q "npm cache" "$H/.local/state/cleanspace/history.tsv"
+check "history rows are tab-separated" eval "awk -F'\t' 'NF == 4 && \$2 == \"npm cache\"' '$H/.local/state/cleanspace/history.tsv' | grep -q ."
+printf '1700000000    pip / Pipenv cache    2048    2048\n' >> "$H/.local/state/cleanspace/history.tsv"   # a row from before 2.2
 OUT=$(cs --stats); check "--stats shows total" has "Freed"
+check "--stats lists what was freed" has "npm cache"
+check "--stats reads rows written before 2.2" has "pip / Pipenv cache"
+check "--stats shows the first date" has "since 20"
 
 # ---- symlinks pointing outside are not followed
 mkdir -p "$H/outside" "$H/.npm"; mk "$H/outside/precious"
@@ -117,7 +122,12 @@ mk "$P/gr/build.gradle" 10;       mk "$P/gr/build/libs/x.jar"    # Gradle output
 mk "$P/docs/build/index.html"                                    # a plain "build" folder, no project file
 mk "$P/unity/Assembly-CSharp.csproj" 10; mk "$P/unity/Library/x"  # Unity cache
 mk "$P/notunity/Library/book.pdf"                                # a folder that just happens to be called Library
-old "$P/old" "$P/php" "$P/py" "$P/orphan" "$P/rand" "$P/net" "$P/gr" "$P/docs" "$P/unity" "$P/notunity"
+mk "$P/pyproj/pyproject.toml" 10;   mk "$P/pyproj/.venv/pyvenv.cfg" 10; mk "$P/pyproj/.venv/lib/x"
+mk "$P/reqs/requirements.txt" 10; mk "$P/reqs/venv/pyvenv.cfg" 10;  mk "$P/reqs/venv/lib/x"
+mk "$P/novenv/pyproject.toml" 10; mk "$P/novenv/.venv/notes.txt"             # called .venv but not a virtualenv
+mk "$P/loose/.venv/pyvenv.cfg" 10                                            # a virtualenv with no project file
+old "$P/old" "$P/php" "$P/py" "$P/orphan" "$P/rand" "$P/net" "$P/gr" "$P/docs" "$P/unity" "$P/notunity" \
+    "$P/pyproj" "$P/reqs" "$P/novenv" "$P/loose"
 touch "$P/fresh/package.json"
 OUT=$(cs --deep "$P" --yes)
 check "stale node_modules removed"        gone   "$P/old/node_modules"
@@ -132,6 +142,10 @@ check "Gradle build removed"              gone   "$P/gr/build"
 check "plain build folder kept"           exists "$P/docs/build/index.html"
 check "Unity Library removed"             gone   "$P/unity/Library"
 check "non-Unity Library kept"            exists "$P/notunity/Library/book.pdf"
+check ".venv removed"                     gone   "$P/pyproj/.venv"
+check "venv removed"                      gone   "$P/reqs/venv"
+check ".venv that is not a virtualenv kept" exists "$P/novenv/.venv/notes.txt"
+check "virtualenv without a project kept" exists "$P/loose/.venv/pyvenv.cfg"
 check "kept projects are reported"        has    "edited in the last 14 days"
 OUT=$(cs --deep "$P" --older 0 --yes)
 check "--older 0 includes recent projects" gone "$P/fresh/node_modules"
@@ -169,6 +183,74 @@ mkdir -p "$H/.config/cleanspace"; echo "auto_below_gb = 999999" > "$H/.config/cl
 OUT=$(cs --auto)
 check "--auto cleans when space is low"   gone   "$H/.npm/_cacache"
 check "--auto leaves Playwright browsers" exists "$CACHE/ms-playwright/chromium/x"
+
+# ---- Docker: the stub expands the --format template the way docker does, \t included
+new_home
+cat > "$H/stub/docker" <<'EOF'
+#!/bin/sh
+case $1 in
+  info) exit 0 ;;
+  system) for row in 'Images|8GB (74%)' 'Build Cache|2GB' 'Local Volumes|5GB (0%)'; do
+            printf '%s\n' "$4" | awk -v t="${row%%|*}" -v r="${row#*|}" \
+              '{ gsub(/\\t/, "\t"); gsub(/\{\{\.Type\}\}/, t); gsub(/\{\{\.Reclaimable\}\}/, r); print }'
+          done ;;
+  *) touch "$HOME/docker-pruned" ;;
+esac
+EOF
+OUT=$(cs --dry-run)
+check "Docker reclaimable space is measured" has "Docker images & build cache *9.3G"
+OUT=$(cs --yes)
+check "Docker is pruned" exists "$H/docker-pruned"
+
+# ---- Docker build cache cap
+new_home
+mk "$H/.npm/_cacache/x"; mkdir -p "$H/.docker"
+printf '{\n  "builder": {\n    "gc": {\n      "defaultKeepStorage": "20GB",\n      "enabled": true\n    }\n  }\n}\n' > "$H/.docker/daemon.json"
+echo n > "$H/answers"
+OUT=$(env -i HOME="$H" PATH="$H/stub:/usr/bin:/bin" TERM=dumb CLEANSPACE_INPUT="$H/answers" "$CS" --dry-run)
+check "Docker cap is offered" has "Cap it at 5GB"
+check "dry run leaves daemon.json" grep -q '"20GB"' "$H/.docker/daemon.json"
+echo y > "$H/answers"
+OUT=$(env -i HOME="$H" PATH="$H/stub:/usr/bin:/bin" TERM=dumb CLEANSPACE_INPUT="$H/answers" "$CS")
+check "Docker cap written" grep -q '"defaultKeepStorage": "5GB"' "$H/.docker/daemon.json"
+check "daemon.json keeps its other settings" grep -q '"enabled": true' "$H/.docker/daemon.json"
+mk "$H/.npm/_cacache/x"
+OUT=$(env -i HOME="$H" PATH="$H/stub:/usr/bin:/bin" TERM=dumb CLEANSPACE_INPUT="$H/answers" "$CS")
+check "Docker cap not offered once capped" eval "! printf '%s' \"\$OUT\" | grep -q 'Cap it'"
+
+if [ "$(uname -s)" = Darwin ]; then
+  # ---- schedule: a script kept on the Desktop runs from a copy launchd may read
+  new_home
+  printf '#!/bin/sh\nexit 0\n' > "$H/stub/launchctl"
+  mkdir -p "$H/Desktop/cleanspace" "$H/.local/bin"; cp "$CS" "$H/Desktop/cleanspace/cleanspace"
+  ln -s "$H/Desktop/cleanspace/cleanspace" "$H/.local/bin/cleanspace"
+  csl() { env -i HOME="$H" PATH="$H/stub:/usr/bin:/bin" TERM=dumb "$H/.local/bin/cleanspace" "$@"; }
+  PL=$H/Library/LaunchAgents/io.github.pantho-haque.cleanspace.plist COPY=$H/.local/state/cleanspace/cleanspace
+  OUT=$(csl --schedule)
+  check "schedule copies a Desktop script" exists "$COPY"
+  check "schedule runs the copy" grep -q "<string>$COPY</string>" "$PL"
+  echo '# edited' >> "$H/Desktop/cleanspace/cleanspace"; OUT=$(csl --dry-run)
+  check "a manual run refreshes the copy" cmp -s "$COPY" "$H/Desktop/cleanspace/cleanspace"
+  OUT=$(csl --schedule off)
+  check "schedule off removes the copy" gone "$COPY"
+  rm "$H/.local/bin/cleanspace"; cp "$CS" "$H/.local/bin/cleanspace"; OUT=$(csl --schedule)
+  check "schedule runs a normal install directly" grep -q "<string>$H/.local/bin/cleanspace</string>" "$PL"
+
+  # ---- quit a running app to clean its cache, then reopen it
+  new_home
+  mk "$CACHE/Firefox/x" 200000000; mk "$H/.npm/_cacache/x"; mkdir -p "$H/Applications/firefox.app" "$H/code"; touch "$H/running"
+  printf '#!/bin/sh\n[ -f "$HOME/running" ]\n' > "$H/stub/pgrep"
+  printf '#!/bin/sh\nrm -f "$HOME/running"\n' > "$H/stub/osascript"
+  printf '#!/bin/sh\ntouch "$HOME/reopened"\n' > "$H/stub/open"; chmod +x "$H/stub/"*
+  echo y > "$H/answers"
+  OUT=$(env -i HOME="$H" PATH="$H/stub:/usr/bin:/bin" TERM=dumb CLEANSPACE_INPUT="$H/answers" "$CS" --deep "$H/code")
+  check "offers to quit the running app" has "Quit firefox to clean it"
+  check "cache of the quit app removed" gone "$CACHE/Firefox"
+  check "quit app is reopened" exists "$H/reopened"
+  touch "$H/running"; mk "$CACHE/Firefox/x" 200000000; rm -f "$H/reopened"
+  OUT=$(cs --deep "$H/code" --yes)
+  check "--yes never quits apps" exists "$CACHE/Firefox/x"
+fi
 
 # ---- a cache dir that points at home is not trusted
 new_home

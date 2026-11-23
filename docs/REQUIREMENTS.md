@@ -1,6 +1,6 @@
 # Requirements
 
-cleanspace 2.1. Each requirement has an ID. "Test" names the check in `tests/run.sh` that covers it,
+cleanspace 2.2. Each requirement has an ID. "Test" names the check in `tests/run.sh` that covers it,
 or says how it is verified.
 
 ## Functional requirements
@@ -30,19 +30,22 @@ or says how it is verified.
 | --- | --- | --- |
 | F10 | Default tier: package manager, build tool, editor, Electron app and Docker caches that the owning tool rebuilds or re-downloads. | --yes removes npm/pip cache |
 | F11 | Use a tool's own clean command when it is installed (`brew cleanup`, `go clean -modcache`, `uv cache clean`, `conda clean`). | manual |
-| F12 | Docker: remove unused images and the build cache only. Containers, stopped ones included, and volumes are kept. | manual (needs Docker) |
-| F13 | `--deep` adds browser caches (never profiles), browser AI models, caches idle for 7+ days, the Trash or Recycle Bin, and project build folders for about 20 ecosystems (see README). | stale node_modules removed, .NET bin removed, Unity Library removed |
-| F14 | A build folder is removed only if its project file is next to it, it is not inside a hidden folder, it is not tracked by git, and the project had no file edits in `--older` days (default 14). | node_modules without package.json, git-tracked vendor kept, recently edited project kept, hidden folders not searched |
-| F15 | Caches of running apps (browsers, Xcode) are skipped. | browser cache kept while browser runs |
+| F12 | Docker: remove unused images and the build cache only. Containers, stopped ones included, and volumes are kept. | Docker reclaimable space is measured, Docker is pruned (stubbed docker) |
+| F13 | `--deep` adds browser caches (never profiles), browser AI models, caches idle for 7+ days, the Trash or Recycle Bin, and project build folders for about 20 ecosystems (see README). | stale node_modules removed, .NET bin removed, Unity Library removed, .venv removed |
+| F14 | A build folder is removed only if its project file is next to it, it is not inside a hidden folder, it is not tracked by git, and the project had no file edits in `--older` days (default 14). A `.venv`/`venv` must also hold `pyvenv.cfg`. | .venv that is not a virtualenv kept, virtualenv without a project kept, node_modules without package.json, git-tracked vendor kept, recently edited project kept, hidden folders not searched |
+| F15 | Caches of running apps (browsers, Xcode) are skipped. On macOS an interactive run offers to quit an app holding over 100 MB of skipped cache, cleans it, then reopens the app. `--yes` and the schedule never quit apps. | browser cache kept while browser runs, offers to quit the running app, quit app is reopened, --yes never quits apps |
 | F16 | Old versions are pruned and the current one is kept: Claude Code, Cursor Agent, JetBrains IDE caches, Xcode DeviceSupport (newest 2 kept). | manual |
 
 ### Automation and insight
 
 | ID | Requirement | Test |
 | --- | --- | --- |
-| F17 | `--schedule [daily|weekly|off]` installs a launchd agent (macOS), a systemd user timer, or a cron entry (Linux). | manual |
+| F17 | `--schedule [daily|weekly|off]` installs a launchd agent (macOS), a systemd user timer, or a cron entry (Linux). On macOS a script kept in a privacy-protected folder (Desktop, Documents, Downloads, iCloud Drive) is run from a copy in the state folder, refreshed by every manual run. | schedule copies a Desktop script, schedule runs the copy, a manual run refreshes the copy |
 | F18 | `--auto` (what the schedule runs) cleans the default tier only when free space is below `auto_below_gb` (default 20). It sends a desktop notification, and suggests `--review` if space is still low. | manual |
-| F19 | Every real clean is recorded. `--stats` shows total freed, the biggest wins, and how fast each cache grows back per week. | history recorded, --stats shows total |
+| F19 | Every real clean is recorded. `--stats` shows total freed, the biggest wins, and how fast each cache grows back per week. | history rows are tab-separated, --stats lists what was freed, --stats reads rows written before 2.2 |
+
+| F24 | If Docker Desktop's `daemon.json` keeps more than 5 GB of build cache, an interactive run offers to cap it at 5 GB (other settings untouched). | Docker cap is offered, Docker cap written, Docker cap not offered once capped |
+| F25 | On macOS, swap over 2 GB is reported with the fix (restart). | manual |
 
 ### Lifecycle
 

@@ -110,8 +110,10 @@ Mk "$P\php\composer.json" 10;  Mk "$P\php\vendor\lib\x"
 Mk "$P\net\app.csproj" 10;     Mk "$P\net\bin\Debug\app.dll"
 Mk "$P\docs\build\index.html"
 Mk "$P\py\app.py" 10;          Mk "$P\py\__pycache__\app.pyc"
+Mk "$P\pyproj\pyproject.toml" 10; Mk "$P\pyproj\.venv\pyvenv.cfg" 10; Mk "$P\pyproj\.venv\lib\x"
+Mk "$P\novenv\pyproject.toml" 10; Mk "$P\novenv\.venv\notes.txt"          # called .venv but not a virtualenv
 Push-Location "$P\php"; git init -q; git add -f vendor composer.json; git -c user.email=t@t -c user.name=t commit -qm init; Pop-Location
-foreach ($d in 'old', 'orphan', 'rand', 'php', 'net', 'docs', 'py') { Old "$P\$d" }
+foreach ($d in 'old', 'orphan', 'rand', 'php', 'net', 'docs', 'py', 'pyproj', 'novenv') { Old "$P\$d" }
 New-Item -ItemType Directory -Force -Path "$A\cleanspace" | Out-Null
 Set-Content -Path "$A\cleanspace\config" -Value 'exclude = Recycle Bin'   # the bin is real even in a fake profile
 CS --deep $P --yes
@@ -123,6 +125,8 @@ Check 'git-tracked vendor kept'           (Test-Path "$P\php\vendor\lib\x")
 Check '.NET bin removed'                  (-not (Test-Path "$P\net\bin"))
 Check 'plain build folder kept'           (Test-Path "$P\docs\build\index.html")
 Check '__pycache__ removed'               (-not (Test-Path "$P\py\__pycache__"))
+Check 'virtualenv removed'                (-not (Test-Path "$P\pyproj\.venv"))
+Check '.venv that is not a virtualenv kept' (Test-Path "$P\novenv\.venv\notes.txt")
 Check 'kept projects are reported'        (Has 'edited in the last 14 days')
 CS --deep $P --older 0 --yes
 Check '--older 0 includes recent projects' (-not (Test-Path "$P\fresh\node_modules"))

@@ -20,7 +20,7 @@
 #
 # Exit codes: 0 done, 1 error, 2 confirmation needed (no terminal, use --yes), 130 interrupted.
 
-VERSION=2.1.0
+VERSION=2.2.0
 unset GUARD GUARDF BACK SIZE NEEDCMD   # item() reads these; never inherit them
 RAW=https://raw.githubusercontent.com/Pantho-Haque/cleanspace/main
 JOB=io.github.pantho-haque.cleanspace
@@ -84,6 +84,9 @@ if [ -f "$CONF" ]; then
   done < "$CONF"
 fi
 OLDER=${OLDER:-$OLDER_CONF}
+# Keep the schedule's copy of the script (see schedule) in step with this one, e.g. after a git pull.
+[ -z "$AUTO" ] && [ -f "$STATE/cleanspace" ] && [ "$SELF" != "$STATE/cleanspace" ] && ! cmp -s "$SELF" "$STATE/cleanspace" &&
+  cp "$SELF" "$STATE/cleanspace"
 
 if [ "$OS" = Darwin ]; then
   C=$HOME/Library/Caches S=$HOME/Library/Application\ Support PNPM=$HOME/Library/pnpm/store YARN=Yarn
@@ -127,7 +130,7 @@ lock() {
   fi
   echo $$ > "$STATE/lock/pid"; LOCKED=1
 }
-cleanup() { [ -n "$SPID" ] && kill "$SPID" 2>/dev/null; [ -n "$LOCKED" ] && rm -rf "$STATE/lock"; }
+cleanup() { [ -n "$SPID" ] && kill "$SPID" 2>/dev/null; [ -n "$LOCKED" ] && rm -rf "$STATE/lock"; [ ${#REOPEN[@]} -gt 0 ] && reopen; }
 interrupted() {
   [ -n "$SPID" ] && kill "$SPID" 2>/dev/null; SPID=
   printf "%s\n${Y}Interrupted.${R}" "$EL"
@@ -166,17 +169,23 @@ totrash() {
 schedule() {
   local when=$1 cron
   if [ "$OS" = Darwin ]; then
-    local plist=$HOME/Library/LaunchAgents/$JOB.plist wd=
-    launchctl bootout "gui/$(id -u)/$JOB" 2>/dev/null; rm -f "$plist"
+    local plist=$HOME/Library/LaunchAgents/$JOB.plist wd= prog=$SELF real=$SELF l
+    launchctl bootout "gui/$(id -u)/$JOB" 2>/dev/null; rm -f "$plist" "$STATE/cleanspace"
     [ "$when" = off ] && return
     [ "$when" = weekly ] && wd='<key>Weekday</key><integer>1</integer>'
     mkdir -p "$HOME/Library/LaunchAgents" "$STATE"
+    while [ -L "$real" ]; do l=$(readlink "$real"); case $l in /*) real=$l ;; *) real=${real%/*}/$l ;; esac; done
+    # macOS privacy rules stop launchd jobs reading ~/Desktop, ~/Documents, ~/Downloads and iCloud Drive
+    # ("Operation not permitted"), so a script kept there is run from a copy, refreshed by every manual run.
+    case $real in "$HOME"/Desktop/*|"$HOME"/Documents/*|"$HOME"/Downloads/*|"$HOME/Library/Mobile Documents"/*)
+      prog=$STATE/cleanspace; cp "$real" "$prog" && chmod +x "$prog" || die "cannot copy the script to $prog" ;;
+    esac
     cat > "$plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>$JOB</string>
-  <key>ProgramArguments</key><array><string>$SELF</string><string>--auto</string></array>
+  <key>ProgramArguments</key><array><string>$prog</string><string>--auto</string></array>
   <key>EnvironmentVariables</key><dict><key>PATH</key><string>$PATH</string></dict>
   <key>StartCalendarInterval</key><dict><key>Hour</key><integer>11</integer><key>Minute</key><integer>0</integer>$wd</dict>
   <key>StandardOutPath</key><string>$STATE/auto.log</string>
@@ -235,16 +244,17 @@ stats() {
   else echo "  Schedule: $s, cleans when free space is below ${AUTO_GB}G  ${D}(log: $(tilde "$STATE/auto.log"))${R}"; fi
   [ -s "$HIST" ] || { echo "  No cleans recorded yet. Run clean to start."; return; }
   local summary first runs freed
-  summary=$(awk -F'\t' '{ runs[$1]=1; tot+=$4; if (!first || $1<first) first=$1 } END { n=0; for (r in runs) n++; print n, tot, first }' "$HIST")
+  # FS: tabs, or the 4 spaces that versions before 2.2 wrote by mistake
+  summary=$(awk -F'\t|    ' '{ runs[$1]=1; tot+=$4; if (!first || $1<first) first=$1 } END { n=0; for (r in runs) n++; print n, tot, first }' "$HIST")
   read -r runs freed first <<< "$summary"
   first=$(date -r "$first" +%F 2>/dev/null || date -d "@$first" +%F)
   echo "  Freed ${G}${B}$(human "$freed")${R} over $runs cleans since $first"
   echo; echo "${B}Biggest wins${R}"
-  awk -F'\t' '{ f[$2]+=$4 } END { for (l in f) if (f[l] > 0) printf "%d\t%s\n", f[l], l }' "$HIST" | sort -rn | head -5 |
+  awk -F'\t|    ' '{ f[$2]+=$4 } END { for (l in f) if (f[l] > 0) printf "%d\t%s\n", f[l], l }' "$HIST" | sort -rn | head -5 |
     while IFS=$'\t' read -r k l; do printf "  %-30s %7s\n" "$l" "$(human "$k")"; done
   # Regrowth: what an item had grown back to at each clean, divided by the time since the clean before.
   local grow
-  grow=$(awk -F'\t' '{ if ($2 in last && $1 > last[$2]) { g[$2]+=$3; dt[$2]+=$1-last[$2] } last[$2]=$1 }
+  grow=$(awk -F'\t|    ' '{ if ($2 in last && $1 > last[$2]) { g[$2]+=$3; dt[$2]+=$1-last[$2] } last[$2]=$1 }
     END { for (l in g) if (dt[l] >= 86400 && g[l] > 0) printf "%d\t%s\n", g[l]/dt[l]*604800, l }' "$HIST" | sort -rn | head -5)
   echo; echo "${B}Fastest to grow back${R}  ${D}(per week, measured between cleans)${R}"
   if [ -z "$grow" ]; then echo "  ${D}needs two cleans at least a day apart${R}"
@@ -343,7 +353,7 @@ safe_path() {  # only ever delete inside home, the cache/config dirs, or folders
 #   BACK     how it comes back: auto | dl | build | gone | manual:<command to get it back>
 #   SIZE     size when there are no paths     NEEDCMD  skip unless the tool's own command is installed
 item() {
-  local label=$1 paths=() cmd=() p had=0 k st=todo why=
+  local label=$1 paths=() cmd=() p had=0 k st=todo why= run=
   shift
   while [ $# -gt 0 ] && [ "$1" != -- ]; do
     p=${1%/}; had=1
@@ -356,12 +366,12 @@ item() {
   k=${SIZE:-$(kb "${paths[@]}")}
   if excluded "$label" || { [ $had = 1 ] && [ ${#paths[@]} = 0 ]; }; then st=excluded
   elif [ "${k:-0}" -eq 0 ]; then st=clean
-  elif [ -n "${GUARD:-}" ] && pgrep -x "$GUARD" >/dev/null 2>&1; then st=skip why="$GUARD is running"
+  elif [ -n "${GUARD:-}" ] && pgrep -x "$GUARD" >/dev/null 2>&1; then st=skip why="$GUARD is running" run=$GUARD
   elif [ -n "${GUARDF:-}" ] && pgrep -f -- "$GUARDF" >/dev/null 2>&1; then st=skip why="a running program uses it"
   elif [ -n "${NEEDCMD:-}" ] && ! command -v "${cmd[0]}" >/dev/null; then st=skip why="${cmd[0]} is not on PATH"
   elif [ -n "$AUTO" ]; then case ${BACK:-$SBACK} in manual:*) st=skip why="needs a manual reinstall, so the schedule leaves it" ;; esac
   fi
-  L[N]=$label SEC[N]=$SECT K[N]=${k:-0} ST[N]=$st WHY[N]=$why BK[N]=${BACK:-$SBACK}
+  L[N]=$label SEC[N]=$SECT K[N]=${k:-0} ST[N]=$st WHY[N]=$why BK[N]=${BACK:-$SBACK} RUN[N]=$run
   local IFS=$'\n'; P[N]="${paths[*]}"
   IFS=$'\x1f'; CMD[N]="${cmd[*]}"
   N=$((N + 1))
@@ -442,7 +452,7 @@ idle_caches() {
 }
 
 docker_kb() {  # reclaimable image + build cache size (docker reports SI units)
-  docker system df --format '{{.Type}}    {{.Reclaimable}}' 2>/dev/null | awk -F'\t' '$1 ~ /Images|Build/ {
+  docker system df --format '{{.Type}}\t{{.Reclaimable}}' 2>/dev/null | awk -F'\t' '$1 ~ /Images|Build/ {
     v=$2; sub(/ .*/, "", v); n=v+0; u=v; gsub(/[0-9.]/, "", u)
     m = u=="kB" || u=="KB" ? 1e3 : u=="MB" ? 1e6 : u=="GB" ? 1e9 : u=="TB" ? 1e12 : 1
     s += n*m/1024 } END { printf "%d", s }'
@@ -452,7 +462,7 @@ docker_kb() {  # reclaimable image + build cache size (docker reports SI units)
 BUILD_NAMES="node_modules .next .nuxt .svelte-kit .angular .astro .expo .metro .turbo .parcel-cache target .xwin-cache .gradle build
   cmake-build-debug cmake-build-release Pods vendor .dart_tool .build .zig-cache zig-cache zig-out _build .elixir_ls .elixir-tools
   .lexical .stack-work dist-newstyle elm-stuff bin obj Library Temp Binaries Intermediate DerivedDataCache .godot .terraform .pixi
-  .terragrunt-cache .output coverage DerivedData .cxx __pycache__ .pytest_cache .mypy_cache .ruff_cache .tox .nox __pypackages__"
+  .terragrunt-cache .output coverage DerivedData .cxx .venv venv __pycache__ .pytest_cache .mypy_cache .ruff_cache .tox .nox __pypackages__"
 PY_CACHES=" __pycache__ .pytest_cache .mypy_cache .ruff_cache .tox .nox __pypackages__ "
 any() { [ -e "$1" ]; }   # any "$dir"/*.csproj: does the glob match something?
 
@@ -484,7 +494,9 @@ owned() {
     .godot)               [ -f "$p/project.godot" ] ;;
     .terraform)           [ -f "$p/.terraform.lock.hcl" ] ;;
     .pixi)                [ -f "$p/pixi.toml" ] ;;
-    *) return 0 ;;        # Python bytecode and tool caches: always safe
+    .venv|venv)           [ -f "$p/$1/pyvenv.cfg" ] && { [ -f "$p/pyproject.toml" ] || [ -f "$p/requirements.txt" ] ||
+                            [ -f "$p/Pipfile" ] || [ -f "$p/setup.py" ]; } ;;              # a real virtualenv you can recreate
+    *) return 0 ;;       # Python bytecode and tool caches: always safe
   esac
 }
 
@@ -687,8 +699,51 @@ notes() {
     note "Intel Homebrew (x86)" /usr/local/Homebrew /usr/local/Cellar /usr/local/Caskroom
   local n; n=$(tmutil listlocalsnapshots / 2>/dev/null | grep -c com.apple)
   [ "${n:-0}" -gt 0 ] && printf "  ${D}·${R}  %-30s %7s  ${D}free with: tmutil thinlocalsnapshots / 999999999999 4${R}\n" "Time Machine local snapshots" "$n"
+  if [ "$OS" = Darwin ]; then   # swap files grow while RAM is short and only shrink on restart
+    local sw; sw=$(sysctl -n vm.swapusage 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "used") { v = $(i+2); sub(/M/, "", v); printf "%d", v * 1024 } }')
+    [ "${sw:-0}" -gt 2097152 ] && printf "  ${D}·${R}  %-30s %7s  ${D}restart to free it; it refills while memory is short${R}\n" "Swap (memory overflow)" "$(human "$sw")"
+  fi
   [ -z "$DEEP" ] && echo "  ${D}Run clean --deep for browser caches, idle app caches, the Trash and old project builds.${R}"
+  docker_cap
 }
+
+# Docker Desktop keeps up to 20 GB of build cache between cleans by default. Offer to cap it at 5 GB.
+docker_cap() {
+  local f=$HOME/.docker/daemon.json cur
+  [ -f "$f" ] && [ -z "$YES" ] && { [ -n "$ASK" ] || [ -n "$DRY" ]; } || return
+  cur=$(sed -n 's/.*"defaultKeepStorage"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -1)
+  [ -n "$cur" ] || return
+  awk -v s="$cur" 'BEGIN { n = s + 0; u = toupper(s); gsub(/[^A-Z]/, "", u)
+    m = u ~ /^T/ ? 1024 : u ~ /^G/ ? 1 : u ~ /^M/ ? 1/1024 : u ~ /^K/ ? 1/1048576 : 1/1073741824
+    exit !(n * m > 5) }' || return
+  echo
+  ask "Docker keeps up to $cur of build cache between cleans. Cap it at 5GB? ${D}(edits $(tilde "$f"), applies when Docker restarts)${R}" || return
+  sed 's/\("defaultKeepStorage"[[:space:]]*:[[:space:]]*"\)[^"]*/\15GB/' "$f" > "$f.tmp" && cat "$f.tmp" > "$f" && rm -f "$f.tmp" &&
+    ok "Docker build cache capped at 5GB. Restart Docker to apply it."
+}
+
+# macOS: offer to quit running apps that hold big caches (browsers are always open), clean them, then reopen the apps.
+REOPEN=()
+quit_apps() {
+  local i a apps= k
+  for ((i = 0; i < N; i++)); do
+    [ "${ST[i]}" = skip ] && [ -n "${RUN[i]}" ] || continue
+    case $'\n'"$apps"$'\n' in *$'\n'"${RUN[i]}"$'\n'*) ;; *) apps="$apps${apps:+$'\n'}${RUN[i]}" ;; esac
+  done
+  [ -n "$apps" ] || return
+  while IFS= read -r a; do
+    [ -d "/Applications/$a.app" ] || [ -d "$HOME/Applications/$a.app" ] || continue   # only apps that can be quit and reopened by name
+    k=0; for ((i = 0; i < N; i++)); do [ "${ST[i]}" = skip ] && [ "${RUN[i]}" = "$a" ] && k=$((k + K[i])); done
+    [ "$k" -ge 102400 ] || continue
+    ask "$a is running and holds $(human "$k") of cache. Quit $a to clean it? ${D}(it reopens afterwards; unsaved work asks first)${R}" || continue
+    osascript -e 'on run a' -e 'with timeout of 30 seconds' -e 'tell application (item 1 of a) to quit' -e 'end timeout' -e 'end run' "$a" </dev/null >/dev/null 2>&1
+    for k in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do pgrep -x "$a" >/dev/null 2>&1 || break; sleep 0.5; done
+    if pgrep -x "$a" >/dev/null 2>&1; then warn "$a did not quit, so its cache is kept"; continue; fi
+    REOPEN+=("$a")
+    for ((i = 0; i < N; i++)); do [ "${ST[i]}" = skip ] && [ "${RUN[i]}" = "$a" ] && ST[i]=todo && TODO+=("$i"); done
+  done <<< "$apps"
+}
+reopen() { local a; for a in "${REOPEN[@]}"; do open -a "$a" 2>/dev/null; done; REOPEN=(); }
 
 back_text() {
   case $1 in
@@ -844,11 +899,12 @@ if [ -z "$YES" ]; then
     for x in $ans; do ST[TODO[x - 1]]=skip; echo "  ${D}skipping ${L[TODO[x - 1]]}${R}"; done
     break
   done
+  [ "$OS" = Darwin ] && quit_apps
 fi
 
 # ---------------------------------------------------------------- clean
 run_item() {
-  local i=$1 paths=() cmd=() before=${K[$1]} after freed rc msg
+  local i=$1 paths=() cmd=() before=${K[$1]} after freed rc msg row
   [ -n "${P[i]}" ] && IFS=$'\n' read -d '' -r -a paths < <(printf '%s' "${P[i]}")
   [ -n "${CMD[i]}" ] && IFS=$'\x1f' read -d '' -r -a cmd < <(printf '%s' "${CMD[i]}")
   msg=$(printf "%-30s %7s  removing…" "${L[i]}" "$(human "$before")")
@@ -865,7 +921,7 @@ run_item() {
   else after=$before freed=0; fi
   [ $freed -lt 0 ] && freed=0
   total=$((total + freed))
-  HROWS="$HROWS$NOW    ${L[i]% (*}    $before    $freed"$'\n'
+  printf -v row '%s\t%s\t%s\t%s\n' "$NOW" "${L[i]% (*}" "$before" "$freed"; HROWS=$HROWS$row
   if [ $rc -ne 0 ] && [ "$after" -gt 0 ]; then
     FAILED=$((FAILED + 1))
     printf "%s  ${Y}!${R}  %-30s ${B}%7s${R} freed  ${D}%s left: in use or protected${R}\n" "$EL" "${L[i]}" "$(human $freed)" "$(human "$after")"
@@ -878,6 +934,7 @@ NOW=$(date +%s) HROWS= FAILED=0 before_df=$(diskfree) RUNNING=1
 echo
 for i in "${TODO[@]}"; do [ "${ST[i]}" = todo ] && run_item "$i"; done
 RUNNING=
+reopen
 [ -n "$HROWS" ] && mkdir -p "$STATE" && printf %s "$HROWS" >> "$HIST"
 
 echo

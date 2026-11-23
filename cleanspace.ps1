@@ -21,7 +21,7 @@
 # Works with Windows PowerShell 5.1 (built into Windows 10/11) and PowerShell 7. Plain ASCII on purpose:
 # PowerShell 5.1 reads scripts without a BOM as the local code page.
 
-$VERSION = '2.1.0'
+$VERSION = '2.2.0'
 $RAW = 'https://raw.githubusercontent.com/Pantho-Haque/cleanspace/main'
 $SELF = $PSCommandPath
 $argv = @($args)
@@ -412,7 +412,7 @@ $BuildNames = @('node_modules', '.next', '.nuxt', '.svelte-kit', '.angular', '.a
   'target', '.xwin-cache', '.gradle', 'build', 'cmake-build-debug', 'cmake-build-release', 'Pods', 'vendor', '.dart_tool', '.build',
   '.zig-cache', 'zig-cache', 'zig-out', '_build', '.elixir_ls', '.elixir-tools', '.lexical', '.stack-work', 'dist-newstyle', 'elm-stuff',
   'bin', 'obj', 'Library', 'Temp', 'Binaries', 'Intermediate', 'DerivedDataCache', '.godot', '.terraform', '.pixi',
-  '.terragrunt-cache', '.output', 'coverage', 'DerivedData', '.cxx',
+  '.terragrunt-cache', '.output', 'coverage', 'DerivedData', '.cxx', '.venv', 'venv',
   '__pycache__', '.pytest_cache', '.mypy_cache', '.ruff_cache', '.tox', '.nox', '__pypackages__')
 $PyCaches = @('__pycache__', '.pytest_cache', '.mypy_cache', '.ruff_cache', '.tox', '.nox', '__pypackages__')
 
@@ -444,6 +444,8 @@ function Test-Owned([string]$name, [string]$p) {
     '.godot' { return (has 'project.godot') }
     '.terraform' { return (has '.terraform.lock.hcl') }
     '.pixi' { return (has 'pixi.toml') }
+    { @('.venv', 'venv') -ccontains $_ } {   # a real virtualenv you can recreate
+      return ((has "$name\pyvenv.cfg") -and ((has 'pyproject.toml') -or (has 'requirements.txt') -or (has 'Pipfile') -or (has 'setup.py'))) }
   }
   return $true   # Python bytecode and tool caches: always safe
 }
