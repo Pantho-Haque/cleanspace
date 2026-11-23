@@ -162,7 +162,7 @@ Check 'target with a keypair kept' (Test-Path "$P\sol\target\deploy\prog-keypair
 # ---- a TEMP that points at the profile itself is not trusted
 New-Home
 Mk "$H\Documents\thesis.docx"; Old "$H\Documents"
-$saveT = $L; $env:TEMP = $H
+$env:USERPROFILE = $H; $env:LOCALAPPDATA = $L; $env:APPDATA = $A; $env:TEMP = $H; $env:TMP = $H   # this profile, with TEMP = the profile
 $script:OUT = (& $exe -NoProfile -ExecutionPolicy Bypass -File $CS --yes 2>&1 | Out-String)
 Check 'TEMP=profile does not delete documents' (Test-Path "$H\Documents\thesis.docx")
 

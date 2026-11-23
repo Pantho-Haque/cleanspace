@@ -83,25 +83,25 @@ function Clear-Progress { if ($UseColor) { Write-Host ("`r" + (' ' * 79) + "`r")
 # ---------------------------------------------------------------- arguments
 $DEEP = $false; $DRY = $false; $YES = $false; $AUTO = $false; $ACTION = ''; $SCHED = ''; $OLDER = -1; $DIRS = @()
 for ($i = 0; $i -lt $argv.Count; $i++) {
-  $a = [string]$argv[$i]
+  $opt = [string]$argv[$i]   # not $a: PowerShell names ignore case, and $A is APPDATA
   $next = ''; if ($i + 1 -lt $argv.Count) { $next = [string]$argv[$i + 1] }
-  if ($a -eq '--deep') {
+  if ($opt -eq '--deep') {
     $DEEP = $true
     if ($next -and -not $next.StartsWith('-')) {
       if (-not (Test-Path -LiteralPath $next -PathType Container)) { Fail "no such folder: $next" }
       $DIRS += $next; $i++
     }
   }
-  elseif ($a -eq '--older') { if ($next -notmatch '^\d+$') { Fail '--older needs a number of days' }; $OLDER = [int]$next; $i++ }
-  elseif ($a -eq '-n' -or $a -eq '--dry-run') { $DRY = $true }
-  elseif ($a -eq '-y' -or $a -eq '--yes') { $YES = $true }
-  elseif ($a -eq '--auto') { $AUTO = $true; $YES = $true }
-  elseif ($a -eq '--schedule') {
-    $ACTION = $a; $SCHED = 'daily'
+  elseif ($opt -eq '--older') { if ($next -notmatch '^\d+$') { Fail '--older needs a number of days' }; $OLDER = [int]$next; $i++ }
+  elseif ($opt -eq '-n' -or $opt -eq '--dry-run') { $DRY = $true }
+  elseif ($opt -eq '-y' -or $opt -eq '--yes') { $YES = $true }
+  elseif ($opt -eq '--auto') { $AUTO = $true; $YES = $true }
+  elseif ($opt -eq '--schedule') {
+    $ACTION = $opt; $SCHED = 'daily'
     if ($next -eq 'daily' -or $next -eq 'weekly' -or $next -eq 'off') { $SCHED = $next; $i++ }
   }
-  elseif (@('--review', '--stats', '--config', '--update', '--remove', '--version', '-h', '--help') -contains $a) { $ACTION = $a }
-  else { Fail "unknown option: $a (see cleanspace --help)" }
+  elseif (@('--review', '--stats', '--config', '--update', '--remove', '--version', '-h', '--help') -contains $opt) { $ACTION = $opt }
+  else { Fail "unknown option: $opt (see cleanspace --help)" }
 }
 
 # ---------------------------------------------------------------- config
@@ -225,14 +225,14 @@ if ($ACTION -eq '--schedule') {
 }
 if ($ACTION -eq '--update') {
   [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-  $tmp = "$SELF.tmp"
-  try { Invoke-WebRequest -UseBasicParsing -Uri "$RAW/cleanspace.ps1" -OutFile $tmp -ErrorAction Stop } catch { Remove-Item $tmp -ErrorAction SilentlyContinue; Fail 'download failed' }
-  $errs = $null; [void][Management.Automation.Language.Parser]::ParseFile($tmp, [ref]$null, [ref]$errs)
-  $m = Select-String -LiteralPath $tmp -Pattern "^\`$VERSION = '([^']+)'" | Select-Object -First 1
-  if ($errs.Count -or -not $m) { Remove-Item $tmp -ErrorAction SilentlyContinue; Fail "downloaded file looks broken, kept $VERSION" }
+  $dl = "$SELF.tmp"
+  try { Invoke-WebRequest -UseBasicParsing -Uri "$RAW/cleanspace.ps1" -OutFile $dl -ErrorAction Stop } catch { Remove-Item $dl -ErrorAction SilentlyContinue; Fail 'download failed' }
+  $errs = $null; [void][Management.Automation.Language.Parser]::ParseFile($dl, [ref]$null, [ref]$errs)
+  $m = Select-String -LiteralPath $dl -Pattern "^\`$VERSION = '([^']+)'" | Select-Object -First 1
+  if ($errs.Count -or -not $m) { Remove-Item $dl -ErrorAction SilentlyContinue; Fail "downloaded file looks broken, kept $VERSION" }
   $new = $m.Matches[0].Groups[1].Value
-  if ($new -eq $VERSION) { Remove-Item $tmp; Ok "already up to date ($VERSION)"; exit 0 }
-  Move-Item -LiteralPath $tmp -Destination $SELF -Force
+  if ($new -eq $VERSION) { Remove-Item $dl; Ok "already up to date ($VERSION)"; exit 0 }
+  Move-Item -LiteralPath $dl -Destination $SELF -Force
   Ok "updated cleanspace $VERSION -> $new"; exit 0
 }
 if ($ACTION -eq '--remove') {
@@ -815,7 +815,7 @@ try {
 
   # ---------------------------------------------------------------- clean
   $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-  $hist = New-Object System.Collections.ArrayList
+  $histRows = New-Object System.Collections.ArrayList
   $failed = 0; $beforeDf = DiskFree
   Say ''
   foreach ($it in $todo) {
@@ -831,7 +831,7 @@ try {
     elseif ($ok) { $after = 0; $freed = $it.KB } else { $after = $it.KB; $freed = 0 }
     if ($freed -lt 0) { $freed = 0 }
     $total += $freed
-    [void]$hist.Add(("{0}`t{1}`t{2}`t{3}" -f $now, ($it.Label -replace ' \(\d+\)$', ''), $it.KB, $freed))
+    [void]$histRows.Add(("{0}`t{1}`t{2}`t{3}" -f $now, ($it.Label -replace ' \(\d+\)$', ''), $it.KB, $freed))
     Clear-Progress
     if ($after -gt 0 -and -not $it.Tool) {
       $failed++
@@ -840,7 +840,7 @@ try {
       Say '  OK  ' Green -NoNewline; Say ('{0,-30} {1,7} freed' -f $it.Label, (Human $freed))
     }
   }
-  if ($hist.Count) { New-Item -ItemType Directory -Force -Path $STATE | Out-Null; Add-Content -LiteralPath $HIST -Value $hist }
+  if ($histRows.Count) { New-Item -ItemType Directory -Force -Path $STATE | Out-Null; Add-Content -LiteralPath $HIST -Value $histRows }
 
   Say ''
   Say "Freed: $(Human $total)" Green
